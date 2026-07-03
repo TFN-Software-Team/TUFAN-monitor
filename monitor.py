@@ -51,9 +51,13 @@ def serial_worker(data_queue, stop_event):
 
     print("TUFAN İzleme Merkezi başlatıldı")
     print(f"Port: {config.SERIAL_PORT} | Dosya: {filename}")
+    if not config.CONFIG_CONFIRMED:
+        print(
+            "UYARI: BATARYA KAPASITESI TEYITSIZ — kalan_enerji_Wh kolonu "
+            "gecersiz (config.py: CONFIG_CONFIRMED=False)"
+        )
 
     prev_seq = None
-    unflushed_count = 0
 
     try:
         while not stop_event.is_set():
@@ -79,7 +83,6 @@ def serial_worker(data_queue, stop_event):
                     log_file.flush()
                     log_file.close()
                     log_file, filename = open_log_file()
-                    unflushed_count = 0
                     data_queue.put({"type": "filename", "name": filename})
                     print(f"YENİ BOOT tespit edildi → {filename}")
 
@@ -87,11 +90,11 @@ def serial_worker(data_queue, stop_event):
 
                 record = format_record(parsed, config.BATTERY_CAPACITY_WH)
                 log_file.write(record + "\n")
-                unflushed_count += 1
-
-                if unflushed_count >= 10:
-                    log_file.flush()
-                    unflushed_count = 0
+                # 9.2.g: kayıt kanıt niteliğindedir — çökme anında veri
+                # kaybı kabul edilemez, bu yüzden her satırda hemen
+                # flush + fsync (OS sayfa önbelleğini de aşıp diske yazar).
+                log_file.flush()
+                os.fsync(log_file.fileno())
 
                 data_queue.put(
                     {
@@ -130,7 +133,13 @@ class MonitorApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("TUFAN Telemetri İzleme Merkezi")
+        title = "TUFAN Telemetri İzleme Merkezi"
+        if not config.CONFIG_CONFIRMED:
+            # 9.2.g: eksik parametre kaydı durduramaz — kayıt akışı devam
+            # eder, ama teyitsiz kapasite pencere başlığında KALICI olarak
+            # görünür kalır (tek satırlık konsol uyarısı gözden kaçabilir).
+            title += " [BATARYA KAPASITESI TEYITSIZ — kalan_enerji_Wh gecersiz]"
+        self.root.title(title)
         self.root.geometry("800x500")
         self.root.minsize(640, 420)
 

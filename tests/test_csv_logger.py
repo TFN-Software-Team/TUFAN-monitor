@@ -35,6 +35,41 @@ def test_format_record_values():
     assert parts[4] == str(round(6283 / 10000 * 1000.0))
 
 
+def test_format_record_energy_full_capacity_at_soc_10000():
+    # soc=10000 (100%) -> kalan_enerji_Wh == kapasitenin tamamı
+    parsed = parse_csv_line("CSV,0,0,0,0,10000,0")
+    record = format_record(parsed, battery_capacity_wh=1000.0)
+    assert record.split(";")[4] == "1000"
+
+
+def test_format_record_energy_half_capacity_at_soc_5000():
+    # soc=5000 (%50) -> kalan_enerji_Wh == kapasitenin yarısı
+    parsed = parse_csv_line("CSV,0,0,0,0,5000,0")
+    record = format_record(parsed, battery_capacity_wh=1000.0)
+    assert record.split(";")[4] == "500"
+
+
+def test_format_record_energy_zero_at_soc_zero():
+    # soc=0 -> kalan_enerji_Wh == 0
+    parsed = parse_csv_line("CSV,0,0,0,0,0,0")
+    record = format_record(parsed, battery_capacity_wh=1000.0)
+    assert record.split(";")[4] == "0"
+
+
+def test_format_record_energy_rounding_is_round_half_to_even():
+    # format_record round() (Python yerleşik) kullanır: banker's rounding,
+    # yani tam ,5 durumunda en yakın ÇİFT sayıya yuvarlar (round-half-even),
+    # her zaman yukarı yuvarlamaz. Bu davranış kasıtlıdır (Python round()
+    # ile aynı), aşağıdaki iki örnek bunu belgeler:
+    #   6285/10000*1000 = 628.5 -> 628 (628 çift, aşağı yuvarlanır)
+    #   6295/10000*1000 = 629.5 -> 630 (630 çift, yukarı yuvarlanır)
+    parsed_down = parse_csv_line("CSV,0,0,0,0,6285,0")
+    assert format_record(parsed_down, battery_capacity_wh=1000.0).split(";")[4] == "628"
+
+    parsed_up = parse_csv_line("CSV,0,0,0,0,6295,0")
+    assert format_record(parsed_up, battery_capacity_wh=1000.0).split(";")[4] == "630"
+
+
 def test_header_format():
     assert HEADER == "zaman_ms;hiz_kmh;T_bat_C;V_bat_C;kalan_enerji_Wh"
 
