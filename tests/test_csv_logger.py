@@ -1,4 +1,16 @@
-from csv_logger import HEADER, detect_new_boot, format_record, parse_csv_line
+import locale
+import os
+
+import pytest
+
+from csv_logger import (
+    HEADER,
+    detect_new_boot,
+    format_event_line,
+    format_record,
+    make_events_log_filename,
+    parse_csv_line,
+)
 
 
 def test_parse_valid_line():
@@ -72,6 +84,64 @@ def test_format_record_energy_rounding_is_round_half_to_even():
 
 def test_header_format():
     assert HEADER == "zaman_ms;hiz_kmh;T_bat_C;V_bat_C;kalan_enerji_Wh"
+
+
+def test_header_matches_spec_byte_for_byte():
+    # 9.2.f: sartname ornegiyle bayt bayt ayni olmali (gizli karakter/encoding
+    # farki olmadigindan emin olmak icin utf-8 bayt karsilastirmasi).
+    assert HEADER.encode("utf-8") == b"zaman_ms;hiz_kmh;T_bat_C;V_bat_C;kalan_enerji_Wh"
+
+
+def test_format_record_has_exactly_five_semicolon_fields_and_no_newline():
+    parsed = parse_csv_line("CSV,12345,300,32,780,6283,42")
+    record = format_record(parsed, battery_capacity_wh=1000.0)
+
+    assert "\n" not in record
+    assert record.count(";") == 4
+    assert len(record.split(";")) == 5
+
+
+def test_format_record_decimal_separator_is_dot_locale_independent():
+    # Ondalik ayrac NOKTA olmali, sistem locale'inden bagimsiz (virgullu
+    # ondalik kullanan bir locale altinda da davranis degismemeli).
+    original = locale.setlocale(locale.LC_NUMERIC)
+    try:
+        comma_locale_set = False
+        for candidate in ("de_DE.UTF-8", "German", "tr_TR.UTF-8", "Turkish"):
+            try:
+                locale.setlocale(locale.LC_NUMERIC, candidate)
+                comma_locale_set = True
+                break
+            except locale.Error:
+                continue
+        if not comma_locale_set:
+            pytest.skip("bu sistemde virgullu-ondalik bir locale bulunamadi")
+
+        parsed = parse_csv_line("CSV,12345,305,32,781,6283,42")
+        record = format_record(parsed, battery_capacity_wh=1000.0)
+
+        assert "," not in record
+        parts = record.split(";")
+        assert parts[1] == "30.5"
+        assert parts[3] == "78.1"
+    finally:
+        locale.setlocale(locale.LC_NUMERIC, original)
+
+
+def test_make_events_log_filename_pattern(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    filename = make_events_log_filename()
+    assert os.path.dirname(filename) == "logs"
+    assert os.path.basename(filename).startswith("events_")
+    assert filename.endswith(".log")
+    assert (tmp_path / "logs").is_dir()
+
+
+def test_format_event_line_has_timestamp_prefix_and_message():
+    from datetime import datetime
+
+    line = format_event_line("SERI PORT KOPTU: test", when=datetime(2026, 1, 2, 3, 4, 5))
+    assert line == "[2026-01-02 03:04:05] SERI PORT KOPTU: test"
 
 
 def test_detect_new_boot_first_packet():

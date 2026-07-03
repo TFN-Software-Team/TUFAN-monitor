@@ -48,7 +48,18 @@ def make_log_filename() -> str:
 
 
 def detect_new_boot(prev_seq: int | None, curr_seq: int) -> bool:
-    """Seq sayacında geriye sıçrama veya sıfırlanma olup olmadığını tespit eder."""
+    """Seq sayacında geriye sıçrama veya sıfırlanma olup olmadığını tespit eder.
+
+    AKS yalnızca gerçek TX anında seq'i artırır (P6: test_replay_sanitize_and_seq
+    ile sabitlendi); bağlantı koptuktan sonra tamponda biriken paketler eski
+    zaman damgasıyla (ts) ama ARTAN seq ile tekrar gönderilir (replay). Bu
+    yüzden yeni-boot tespiti yalnızca seq'e bakar, ts'e bakmaz — ts geriye
+    gitmesi replay'in normal bir parçasıdır, yeni boot'un işareti değildir.
+
+    seq alanı uint32'dir; bir yarış (~birkaç saat, 5 sn'lik örnekleme
+    aralığında yüz binlerce paket) süresince 2**32 paketi bulamayacağından
+    sayaç taşması (overflow) bu tespit mantığının kapsamı dışında bırakılmıştır.
+    """
     if prev_seq is None:
         return False
     if curr_seq < prev_seq:
@@ -56,3 +67,19 @@ def detect_new_boot(prev_seq: int | None, curr_seq: int) -> bool:
     if curr_seq < 10 and prev_seq > 100:
         return True
     return False
+
+
+def make_events_log_filename() -> str:
+    """PC tarih/saatine göre eşsiz bir olay (link/port durumu) log dosyası adı
+    üretir; logs/ klasörünü oluşturur. CSV telemetri dosyasından ayrıdır ve
+    5 kolonlu CSV şemasını etkilemez."""
+    os.makedirs("logs", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join("logs", f"events_{timestamp}.log")
+
+
+def format_event_line(message: str, when: datetime | None = None) -> str:
+    """Bir olayı ("SERI PORT KOPTU", "LINK,DOWN" vb.) zaman damgalı events log
+    satırına dönüştürür. `when` testte sabit bir zaman enjekte etmek için var."""
+    ts = (when or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+    return f"[{ts}] {message}"
