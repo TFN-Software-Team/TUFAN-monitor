@@ -1,6 +1,6 @@
 """TUFAN İzleme Merkezi - ayarlar."""
 
-SERIAL_PORT = "COM3"          # kullanıcı değiştirir
+SERIAL_PORT = "SIMULATE"          # kullanıcı değiştirir ("SIMULATE" veya "COM3" / "/dev/cu.usbserial-xxx")
 SERIAL_BAUD = 115200          # UKS USART1 baud hızı
 
 # 9.2.f: izleme merkezi kaydında kalan_enerji_Wh kolonu zorunludur.
