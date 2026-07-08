@@ -41,7 +41,50 @@ def open_events_log():
     return open(filename, "a", encoding="utf-8")
 
 
+class MockSerial:
+    def __init__(self):
+        self.seq = 0
+        self.start_time = time.time()
+        self.speed = 50.0
+        self.soc = 90.0
+        self.temp = 35
+
+    def readline(self):
+        time.sleep(1.0)  # 1 saniye aralıklarla veri simüle et
+        elapsed_ms = int((time.time() - self.start_time) * 1000)
+        self.seq += 1
+        
+        import random
+        self.speed += random.uniform(-3, 3)
+        self.speed = max(0, min(config.MAX_SPEED_KMH - 20, self.speed))
+        
+        self.temp += random.choice([-1, 0, 1])
+        self.temp = max(20, min(65, self.temp))
+        
+        self.soc -= 0.05
+        self.soc = max(0, self.soc)
+        
+        voltage = 45.0 + (self.soc / 100.0) * 8.0
+        
+        speed_x10 = int(self.speed * 10)
+        voltage_deciv = int(voltage * 10)
+        soc_hundredths = int(self.soc * 100)
+        
+        # Rastgele LINK durumları
+        if self.seq % 40 == 0:
+            return b"LINK,DOWN\r\n"
+        elif self.seq % 42 == 0:
+            return b"LINK,UP\r\n"
+            
+        return f"CSV,{elapsed_ms},{speed_x10},{self.temp},{voltage_deciv},{soc_hundredths},{self.seq}\r\n".encode('utf-8')
+
+    def close(self):
+        pass
+
+
 def open_serial_connection():
+    if config.SERIAL_PORT == "SIMULATE":
+        return MockSerial()
     return serial.Serial(config.SERIAL_PORT, config.SERIAL_BAUD, timeout=2)
 
 
@@ -190,6 +233,96 @@ def serial_worker(data_queue, stop_event, connect=open_serial_connection,
         print(f"İzleme durduruldu. Dosya kaydedildi: {filename}")
 
 
+class MetricCard:
+    def __init__(self, parent, title, unit, min_val, max_val, color):
+        self.title = title
+        self.unit = unit
+        self.min_val = min_val
+        self.max_val = max_val
+        self.color = color
+        self.current_value = 0.0
+
+        # Frame
+        self.frame = tk.Frame(parent, bg="#161D30", bd=0, highlightthickness=1, highlightbackground="#242F4D")
+
+        # Left accent line
+        self.accent_line = tk.Frame(self.frame, bg=color, width=4)
+        self.accent_line.pack(side="left", fill="y")
+
+        # Main inner container
+        self.inner = tk.Frame(self.frame, bg="#161D30", padx=12, pady=10)
+        self.inner.pack(side="left", fill="both", expand=True)
+
+        # Center container inside inner to center vertically
+        self.center_container = tk.Frame(self.inner, bg="#161D30")
+        self.center_container.pack(expand=True, fill="x")
+
+        # Top row: Title & Unit
+        header_frame = tk.Frame(self.center_container, bg="#161D30")
+        header_frame.pack(fill="x", side="top")
+
+        self.title_label = tk.Label(header_frame, text=title.upper(), font=("Helvetica Neue", 11, "bold"), fg="#94A3B8", bg="#161D30")
+        self.title_label.pack(side="left")
+
+        # Value & Unit row
+        value_frame = tk.Frame(self.center_container, bg="#161D30")
+        value_frame.pack(fill="x", side="top", pady=(2, 4))
+
+        self.value_label = tk.Label(value_frame, text="--", font=("Helvetica Neue", 20, "bold"), fg=color, bg="#161D30")
+        self.value_label.pack(side="left")
+
+        self.unit_label = tk.Label(value_frame, text=f" {unit}", font=("Helvetica Neue", 10, "bold"), fg="#64748B", bg="#161D30")
+        self.unit_label.pack(side="left", anchor="s", pady=(0, 2))
+
+        # Sleek custom canvas progress bar at the bottom
+        self.canvas = tk.Canvas(self.center_container, height=4, bg="#1E293B", highlightthickness=0, bd=0)
+        self.canvas.pack(fill="x", side="top", pady=(2, 0))
+
+        self.bar = self.canvas.create_rectangle(0, 0, 0, 4, fill=color, width=0)
+        self.canvas.bind("<Configure>", self._on_resize)
+
+    def _on_resize(self, event=None):
+        self.update_bar()
+
+    def set_value(self, value):
+        try:
+            self.current_value = float(value)
+        except (ValueError, TypeError):
+            self.current_value = 0.0
+
+        if isinstance(value, float):
+            val_str = f"{value:.1f}"
+        else:
+            val_str = f"{value}"
+
+        self.value_label.config(text=val_str)
+
+        # Dynamic temperature coloring
+        if self.title == "SICAKLIK":
+            if self.current_value >= 60.0:
+                dynamic_color = "#EF4444"  # Red
+            elif self.current_value >= 50.0:
+                dynamic_color = "#F59E0B"  # Yellow/Orange
+            else:
+                dynamic_color = self.color  # Default Orange (#F97316)
+            self.value_label.config(fg=dynamic_color)
+            self.canvas.itemconfig(self.bar, fill=dynamic_color)
+
+        self.update_bar()
+
+    def update_bar(self):
+        span = self.max_val - self.min_val
+        if span <= 0:
+            pct = 0.0
+        else:
+            pct = (self.current_value - self.min_val) / span
+        pct = max(0.0, min(1.0, pct))
+
+        width = self.canvas.winfo_width()
+        if width > 1:
+            self.canvas.coords(self.bar, 0, 0, int(width * pct), 4)
+
+
 class MonitorApp:
     """tkinter tabanlı TUFAN telemetri izleme penceresi."""
 
@@ -202,8 +335,9 @@ class MonitorApp:
             # görünür kalır (tek satırlık konsol uyarısı gözden kaçabilir).
             title += " [BATARYA KAPASITESI TEYITSIZ — kalan_enerji_Wh gecersiz]"
         self.root.title(title)
-        self.root.geometry("800x500")
-        self.root.minsize(640, 420)
+        self.root.geometry("1020x600")
+        self.root.minsize(960, 520)
+        self.root.configure(bg="#0B0F19")
 
         self.data_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -227,89 +361,151 @@ class MonitorApp:
         self.root.after(GUI_POLL_MS, self.update_gui)
 
     def _build_widgets(self):
-        gauge_frame = tk.Frame(self.root)
-        gauge_frame.pack(fill="x", padx=10, pady=10)
-        gauge_frame.columnconfigure(0, weight=1)
-        gauge_frame.columnconfigure(1, weight=1)
-
-        self.speed_value, _ = self._make_gauge(gauge_frame, "HIZ", "km/h", 0, 0)
-        self.temp_value, _ = self._make_gauge(gauge_frame, "SICAKLIK", "°C", 0, 1)
-        self.voltage_value, _ = self._make_gauge(gauge_frame, "GERİLİM", "V", 1, 0)
-        self.soc_value, _ = self._make_gauge(gauge_frame, "SoC", "%", 1, 1)
-
-        energy_frame = tk.Frame(gauge_frame, relief="groove", borderwidth=2, padx=10, pady=8)
-        energy_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=4, pady=4)
-        self.energy_label = tk.Label(
-            energy_frame, text="KALAN ENERJİ: -- Wh", font=("Segoe UI", 14, "bold")
+        # Header panel
+        header_frame = tk.Frame(self.root, bg="#0B0F19")
+        header_frame.pack(fill="x", padx=15, pady=(15, 10))
+        
+        title_container = tk.Frame(header_frame, bg="#0B0F19")
+        title_container.pack(side="left")
+        
+        title_label = tk.Label(
+            title_container, 
+            text="TUFAN ELEKTROMOBİL TELEMETRİ SİSTEMİ", 
+            font=("Helvetica Neue", 16, "bold"), 
+            fg="#F8FAFC", 
+            bg="#0B0F19"
         )
-        self.energy_label.pack()
+        title_label.pack(anchor="w")
+        
+        self.file_label = tk.Label(
+            title_container, 
+            text="● BEKLEMEDE: Kayıt dosyası oluşturuluyor...", 
+            font=("Helvetica Neue", 9, "bold"), 
+            fg="#475569", 
+            bg="#0B0F19"
+        )
+        self.file_label.pack(anchor="w", pady=(2, 0))
+        
+        team_label = tk.Label(
+            header_frame, 
+            text="TFN SOFTWARE TEAM", 
+            font=("Helvetica Neue", 9, "bold"), 
+            fg="#00D2FF", 
+            bg="#0B0F19",
+            padx=10,
+            pady=4,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#00D2FF"
+        )
+        team_label.pack(side="right", anchor="n", pady=2)
 
-        status_frame = tk.Frame(self.root)
-        status_frame.pack(fill="x", padx=10, pady=(0, 5))
+        # Main workspace container (Left/Right Split)
+        main_container = tk.Frame(self.root, bg="#0B0F19")
+        main_container.pack(fill="both", expand=True, padx=15, pady=(5, 5))
+
+        # LEFT PANEL (Wide Telemetry Plot - 60% Width)
+        left_panel = tk.Frame(main_container, bg="#0B0F19")
+        left_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
+
+        # Graph Card wrapper to match right cards styling and align edges
+        graph_card = tk.Frame(left_panel, bg="#161D30", bd=0, highlightthickness=1, highlightbackground="#242F4D", padx=10, pady=10)
+        graph_card.pack(fill="both", expand=True)
+
+        self.figure = Figure(figsize=(6.5, 4.2), dpi=90, facecolor='#161D30')
+        self.ax = self.figure.add_subplot(111, facecolor='#161D30')
+        self.ax.set_ylim(0, config.MAX_SPEED_KMH)
+        self.ax.set_xlim(0, config.GRAPH_WINDOW_SEC)
+        
+        # Style grid & spines
+        self.ax.spines['bottom'].set_color('#334155')
+        self.ax.spines['left'].set_color('#334155')
+        self.ax.spines['top'].set_visible(False)
+        self.ax.spines['right'].set_visible(False)
+        self.ax.tick_params(colors='#94A3B8', which='both', labelsize=9)
+        self.ax.xaxis.label.set_color('#94A3B8')
+        self.ax.yaxis.label.set_color('#94A3B8')
+        
+        self.ax.set_xlabel("Zaman (sn)", fontsize=9, labelpad=5)
+        self.ax.set_ylabel("Hız (km/h)", fontsize=9, labelpad=5)
+        self.ax.set_title("HIZ PROFİLİ (GERÇEK ZAMANLI SWEEP)", fontdict={'color': '#F8FAFC', 'weight': 'bold', 'size': 10}, pad=10)
+        self.ax.grid(True, color='#242F4D', linestyle='--', linewidth=0.5)
+        
+        (self.speed_line,) = self.ax.plot([], [], color="#00D2FF", linewidth=2.5)
+        self.figure.tight_layout()
+
+        self.canvas = FigureCanvasTkAgg(self.figure, master=graph_card)
+        self.canvas.get_tk_widget().config(bg="#161D30", highlightthickness=0, takefocus=0)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # RIGHT PANEL (Metric Cards Column - 40% Width)
+        right_panel = tk.Frame(main_container, bg="#0B0F19", width=300)
+        right_panel.pack(side="right", fill="both", padx=(10, 0))
+        right_panel.pack_propagate(False) # Stable layout
+
+        # Define 1 column and 5 rows
+        for r in range(5):
+            right_panel.rowconfigure(r, weight=1)
+        right_panel.columnconfigure(0, weight=1)
+
+        # Create cards inside the column
+        self.speed_card = MetricCard(right_panel, "HIZ", "km/h", 0, config.MAX_SPEED_KMH, "#00D2FF")
+        self.speed_card.frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+
+        self.soc_card = MetricCard(right_panel, "SoC", "%", 0, 100, "#10B981")
+        self.soc_card.frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+
+        self.voltage_card = MetricCard(right_panel, "GERİLİM", "V", 40.0, 60.0, "#A855F7")
+        self.voltage_card.frame.grid(row=2, column=0, sticky="nsew", padx=4, pady=4)
+
+        self.energy_card = MetricCard(right_panel, "KALAN ENERJİ", "Wh", 0, config.BATTERY_CAPACITY_WH, "#0EA5E9")
+        self.energy_card.frame.grid(row=3, column=0, sticky="nsew", padx=4, pady=4)
+
+        self.temp_card = MetricCard(right_panel, "SICAKLIK", "°C", 20, 80, "#F97316")
+        self.temp_card.frame.grid(row=4, column=0, sticky="nsew", padx=4, pady=4)
+
+        # Status frame (Footer)
+        status_frame = tk.Frame(self.root, bg="#0B0F19")
+        status_frame.pack(fill="x", padx=15, pady=(0, 10))
 
         self.status_badge = tk.Label(
             status_frame,
             text="KOPUK",
-            font=("Segoe UI", 12, "bold"),
-            bg="#c0392b",
+            font=("Helvetica Neue", 10, "bold"),
+            bg="#EF4444",
             fg="white",
-            width=10,
+            width=12,
             padx=8,
             pady=4,
+            bd=0,
+            highlightthickness=0
         )
         self.status_badge.pack(side="left")
 
-        self.file_label = tk.Label(status_frame, text="Dosya: --")
-        self.file_label.pack(side="left", padx=15)
-
-        self.packet_label = tk.Label(status_frame, text="Alınan paket: 0")
+        self.packet_label = tk.Label(status_frame, text="Alınan paket: 0", font=("Helvetica Neue", 9), fg="#64748B", bg="#0B0F19")
         self.packet_label.pack(side="left", padx=15)
 
-        # 9.2.h: ≤5 sn örnekleme aralığı göstergesi — CSV'ye ek satır yazmaz,
-        # yalnızca son kayıttan bu yana geçen süreyi izler.
-        self._default_interval_bg = status_frame.cget("bg")
-        self.interval_label = tk.Label(status_frame, text="Son kayıt: --", padx=6)
+        self._default_interval_bg = "#161D30"
+        self.interval_label = tk.Label(
+            status_frame, 
+            text="Son kayıt: --", 
+            font=("Helvetica Neue", 9), 
+            fg="#94A3B8", 
+            bg="#161D30", 
+            padx=8, 
+            pady=3, 
+            highlightthickness=1, 
+            highlightbackground="#242F4D"
+        )
         self.interval_label.pack(side="left", padx=15)
-
-        self.figure = Figure(figsize=(7.5, 2.6), dpi=90)
-        self.ax = self.figure.add_subplot(111)
-        self.ax.set_ylim(0, config.MAX_SPEED_KMH)
-        self.ax.set_xlim(0, config.GRAPH_WINDOW_SEC)
-        self.ax.set_xlabel("Zaman (sn)")
-        self.ax.set_ylabel("Hız (km/h)")
-        (self.speed_line,) = self.ax.plot([], [], color="tab:blue")
-        self.figure.tight_layout()
-
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self.root)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=5)
-
-    def _make_gauge(self, parent, title, unit, row, col):
-        frame = tk.Frame(parent, relief="groove", borderwidth=2, padx=10, pady=8)
-        frame.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
-
-        title_label = tk.Label(frame, text=title, font=("Segoe UI", 11, "bold"))
-        title_label.pack(anchor="w")
-
-        value_row = tk.Frame(frame)
-        value_row.pack(anchor="w")
-
-        value_label = tk.Label(value_row, text="--", font=("Segoe UI", 28, "bold"))
-        value_label.pack(side="left")
-
-        unit_label = tk.Label(value_row, text=f" {unit}", font=("Segoe UI", 11))
-        unit_label.pack(side="left", anchor="s")
-
-        return value_label, unit_label
 
     def _refresh_status_badge(self):
         if not self.port_connected:
-            # Fiziksel port kaybı (USB çekilmesi vb.) — link durumundan ayrı
-            # ve daha öncelikli gösterilir.
-            self.status_badge.config(text="SERİ PORT KOPUK", bg="#7f8c8d")
+            self.status_badge.config(text="SERİ PORT KOPUK", bg="#64748B", fg="white")
         elif not self.link_connected:
-            self.status_badge.config(text="KOPUK", bg="#c0392b")
+            self.status_badge.config(text="KOPUK", bg="#EF4444", fg="white")
         else:
-            self.status_badge.config(text="BAĞLI", bg="#27ae60")
+            self.status_badge.config(text="BAĞLI", bg="#10B981", fg="white")
 
     def update_gui(self):
         now = time.monotonic()
@@ -326,11 +522,11 @@ class MonitorApp:
                 self.last_packet_time = msg["ts"]
                 self.packet_count += 1
 
-                self.speed_value.config(text=f"{msg['speed_kmh']:.1f}")
-                self.temp_value.config(text=f"{msg['temp_c']}")
-                self.voltage_value.config(text=f"{msg['voltage_v']:.1f}")
-                self.soc_value.config(text=f"{msg['soc_percent']:.1f}")
-                self.energy_label.config(text=f"KALAN ENERJİ: {msg['energy_wh']} Wh")
+                self.speed_card.set_value(msg['speed_kmh'])
+                self.temp_card.set_value(msg['temp_c'])
+                self.voltage_card.set_value(msg['voltage_v'])
+                self.soc_card.set_value(msg['soc_percent'])
+                self.energy_card.set_value(msg['energy_wh'])
                 self.packet_label.config(text=f"Alınan paket: {self.packet_count}")
 
                 self.speed_history.append((msg["ts"] - self.start_time, msg["speed_kmh"]))
@@ -351,7 +547,7 @@ class MonitorApp:
                 self.port_connected = True
 
             elif msg_type == "filename":
-                self.file_label.config(text=f"Dosya: {os.path.basename(msg['name'])}")
+                self.file_label.config(text=f"● KAYIT AKTİF: logs/{os.path.basename(msg['name'])}", fg="#10B981")
 
         if self.last_packet_time is not None and (now - self.last_packet_time) > LINK_TIMEOUT_SEC:
             self.link_connected = False
@@ -367,17 +563,17 @@ class MonitorApp:
 
     def _refresh_interval_indicator(self, now):
         if self.last_packet_time is None:
-            self.interval_label.config(text="Son kayıt: --", bg=self._default_interval_bg)
+            self.interval_label.config(text="Son kayıt: --", bg=self._default_interval_bg, fg="#94A3B8")
             return
 
         elapsed = now - self.last_packet_time
         self.interval_label.config(text=f"Son kayıttan bu yana: {elapsed:.1f} sn")
         if elapsed > 5.0:
-            self.interval_label.config(bg="#c0392b", fg="white")
+            self.interval_label.config(bg="#EF4444", fg="white")
         elif elapsed > 4.0:
-            self.interval_label.config(bg="#f1c40f", fg="black")
+            self.interval_label.config(bg="#F97316", fg="white")
         else:
-            self.interval_label.config(bg=self._default_interval_bg, fg="black")
+            self.interval_label.config(bg=self._default_interval_bg, fg="#94A3B8")
 
     def _redraw_graph(self, t_now):
         if self.speed_history:
