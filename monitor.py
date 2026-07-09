@@ -16,6 +16,7 @@ from csv_logger import (
     detect_new_boot,
     format_event_line,
     format_record,
+    is_replay_ts,
     make_events_log_filename,
     make_log_filename,
     parse_csv_line,
@@ -118,6 +119,7 @@ def serial_worker(data_queue, stop_event, connect=open_serial_connection,
         )
 
     prev_seq = None
+    prev_ts_ms = None
     ser = None
 
     try:
@@ -171,6 +173,7 @@ def serial_worker(data_queue, stop_event, connect=open_serial_connection,
                     continue
 
                 curr_seq = parsed["seq"]
+                curr_ts_ms = parsed["timestamp_ms"]
                 if detect_new_boot(prev_seq, curr_seq):
                     log_file.flush()
                     log_file.close()
@@ -178,8 +181,18 @@ def serial_worker(data_queue, stop_event, connect=open_serial_connection,
                     data_queue.put({"type": "filename", "name": filename})
                     log_event(f"YENI BOOT tespit edildi -> {filename}")
                     print(f"YENİ BOOT tespit edildi → {filename}")
+                elif is_replay_ts(prev_ts_ms, curr_ts_ms):
+                    # 9.2.e: AKS offline-buffer drenajı sırasında replay edilen
+                    # paketler eski ts taşır ama seq artmaya devam eder (bkz.
+                    # csv_logger.detect_new_boot) — CSV satırı normal şekilde
+                    # yazılır, bu yalnızca teşhis/jüri için events log notudur.
+                    log_event(
+                        f"REPLAY? ts_ms geriye gitti: {prev_ts_ms} -> {curr_ts_ms} "
+                        f"(seq {prev_seq} -> {curr_seq})"
+                    )
 
                 prev_seq = curr_seq
+                prev_ts_ms = curr_ts_ms
 
                 record = format_record(parsed, config.BATTERY_CAPACITY_WH)
                 log_file.write(record + "\n")

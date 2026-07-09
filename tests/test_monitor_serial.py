@@ -163,6 +163,51 @@ def test_serial_never_available_does_not_crash_and_keeps_retrying(tmp_path, monk
     assert log_files[0].read_text(encoding="utf-8").splitlines() == [HEADER]
 
 
+def test_replay_ts_regression_logs_tag_without_touching_csv_schema(tmp_path, monkeypatch):
+    """9.2.e: offline-buffer drenaji sirasinda ts_ms geriye gittiginde
+    (seq artmaya devam ederken) events log'a zaman damgali "REPLAY?" notu
+    dusulmeli; CSV dosyasi/semasi (5 kolon, tek dosya) bundan ETKILENMEMELI."""
+    monkeypatch.chdir(tmp_path)
+
+    batch = [
+        csv_line(100000, 300, 32, 780, 6283, 100),
+        csv_line(41000, 300, 32, 780, 6283, 101),   # replay: ts geriye gitti
+        csv_line(100100, 300, 32, 780, 6283, 102),  # canli
+        csv_line(42000, 300, 32, 780, 6283, 103),   # replay: ts geriye gitti
+        csv_line(100200, 300, 32, 780, 6283, 104),  # canli
+    ]
+    connect = scripted_connect_factory([batch])
+
+    data_queue = queue.Queue()
+    stop_event = threading.Event()
+
+    worker = threading.Thread(
+        target=monitor.serial_worker,
+        args=(data_queue, stop_event),
+        kwargs={"connect": connect, "reconnect_interval": 0.02},
+        daemon=True,
+    )
+    worker.start()
+
+    messages = drain_until(data_queue, "csv", 5)
+    stop_event.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    log_files = list((tmp_path / "logs").glob("telem_*.csv"))
+    assert len(log_files) == 1, "REPLAY? notu yeni dosya actirmamali"
+    lines = log_files[0].read_text(encoding="utf-8").splitlines()
+    assert lines[0] == HEADER
+    assert len(lines) == 1 + 5
+    for line in lines[1:]:
+        assert len(line.split(";")) == 5, "5 kolonlu sema korunmali"
+
+    events_files = list((tmp_path / "logs").glob("events_*.log"))
+    events_text = events_files[0].read_text(encoding="utf-8")
+    assert events_text.count("REPLAY?") == 2, "yalniz gercekten geriye giden 2 ts icin not dusulmeli"
+    assert "YENI BOOT" not in events_text, "bu senaryo gercek boot degil, replay"
+
+
 def test_link_down_up_lines_not_written_to_csv(tmp_path, monkeypatch):
     """LINK,DOWN / LINK,UP satirlari 5 kolonlu CSV semasini bozmamali;
     sadece GUI/events log'a yansimali."""

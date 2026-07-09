@@ -8,6 +8,7 @@ from csv_logger import (
     detect_new_boot,
     format_event_line,
     format_record,
+    is_replay_ts,
     make_events_log_filename,
     parse_csv_line,
 )
@@ -154,3 +155,67 @@ def test_detect_new_boot_normal():
 
 def test_detect_new_boot_reset():
     assert detect_new_boot(500, 2) is True
+
+
+def _simulate_boot_count(seq_ts_pairs):
+    """serial_worker'daki prev_seq izleme mantigini tekrarlar: her (seq, ts)
+    ciftini sirayla detect_new_boot'a verir, kac kez yeni-boot tetiklendigini
+    sayar. ts burada yalniz okunabilirlik icin tasiniyor, detect_new_boot'a
+    verilmiyor (fonksiyon zaten ts'i gormez)."""
+    prev_seq = None
+    boots = 0
+    for seq, _ts in seq_ts_pairs:
+        if detect_new_boot(prev_seq, seq):
+            boots += 1
+        prev_seq = seq
+    return boots
+
+
+def test_detect_new_boot_ignores_offline_buffer_zip_drain_replay():
+    # AKS kontratı (ESP_AKS lib/Telemetry/Telemetry.cpp:sendStatus +
+    # test_replay_then_live_seq_is_sequential_and_monotonic): seq yalnizca
+    # gercek TX aninda artar, hem canli hem replay paketler icin — bu yuzden
+    # 60 sn'lik kesinti sonrasi fermuar drenaji sirasinda seq HIC durmadan
+    # artar, yalniz ts_ms replay paketlerinde (kesinti anindaki eski deger)
+    # geriye siçrar. Bu senaryoda TEK BIR yeni dosya bile acilmamali.
+    sequence = [
+        (98, 98000), (99, 99000), (100, 100000),  # kesintiden hemen once
+        # fermuar drenaji: 1 replay + 1 canli / tik, seq kesintisiz artar
+        (101, 41000), (102, 100100),
+        (103, 42000), (104, 100200),
+        (105, 43000), (106, 100300),
+        (107, 44000), (108, 100400),
+        (109, 45000), (110, 100500),  # drenaj biter, artik hep canli
+        (111, 100600), (112, 100700),
+    ]
+    assert _simulate_boot_count(sequence) == 0
+
+
+def test_detect_new_boot_real_boot_after_running():
+    sequence = [(100, 100000), (0, 1200)]
+    assert _simulate_boot_count(sequence) == 1
+
+
+def test_detect_new_boot_two_consecutive_real_boots():
+    sequence = [
+        (100, 100000),
+        (0, 1200),      # 1. gercek boot
+        (1, 2200),
+        (50, 51000),
+        (0, 900),       # 2. gercek boot
+        (1, 1900),
+    ]
+    assert _simulate_boot_count(sequence) == 2
+
+
+def test_is_replay_ts_first_sample_is_never_replay():
+    assert is_replay_ts(None, 12345) is False
+
+
+def test_is_replay_ts_true_when_ts_goes_backward():
+    assert is_replay_ts(100000, 41000) is True
+
+
+def test_is_replay_ts_false_when_ts_advances_or_holds():
+    assert is_replay_ts(100000, 100500) is False
+    assert is_replay_ts(100000, 100000) is False

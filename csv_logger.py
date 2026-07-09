@@ -69,6 +69,18 @@ def detect_new_boot(prev_seq: int | None, curr_seq: int) -> bool:
     return False
 
 
+def is_replay_ts(prev_ts_ms: int | None, curr_ts_ms: int) -> bool:
+    """ts_ms öncekinden küçükse True döner (AKS offline-buffer drenajı
+    sırasında eski zaman damgasıyla tekrar gönderilen paketin işareti,
+    9.2.e). Yalnızca teşhis/jüri kaydı içindir — detect_new_boot False
+    döndüğünde (yeni boot DEĞİL) çağıran taraf bunu "REPLAY?" olarak
+    events log'a not düşer; CSV dosyasını veya new-boot kararını etkilemez.
+    """
+    if prev_ts_ms is None:
+        return False
+    return curr_ts_ms < prev_ts_ms
+
+
 def make_events_log_filename() -> str:
     """PC tarih/saatine göre eşsiz bir olay (link/port durumu) log dosyası adı
     üretir; logs/ klasörünü oluşturur. CSV telemetri dosyasından ayrıdır ve

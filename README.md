@@ -71,6 +71,20 @@ vb.) uygulama KAPANMAZ:
 - Tüm port ve link olayları (`logs/events_YYYYMMDD_HHMMSS.log`) zaman
   damgalı olarak ayrı bir olay günlüğüne yazılır; bu dosya CSV şemasını
   etkilemez ve `logs/` altında olduğundan repoya girmez (`.gitignore`).
+- **Jüri notu (9.2.e):** Yönetmelik madde 9.2.e, bağlantı yeniden
+  sağlandığında aracın kesinti sırasında biriktirdiği kayıtların izleme
+  merkezine aktarılmasını (replay) ve kaydın AYNI dosyada DEVAM etmesini
+  öngörür. AKS bu replay'i "fermuar" yöntemiyle yapar: her verici turunda
+  1 canlı + en fazla 1 tamponlanmış paket gönderilir; tamponlanmış
+  paketler kesinti anındaki eski `zaman_ms` değerini taşır. Bu yüzden CSV
+  dosyasında drenaj süresince `zaman_ms` kolonunun GERİYE sıçraması
+  **beklenen ve şartnameye uygun** bir davranıştır — bir hata değildir.
+  Monitor bunu gerçek araç sıfırlanmasından (`seq` sayacının geriye
+  sıçraması/sıfırlanması) ayırt eder: replay sırasında `seq` kesintisiz
+  ARTAR (bkz. `csv_logger.detect_new_boot`), bu yüzden yeni dosya
+  AÇILMAZ; her replay tespiti ayrıca `logs/events_*.log` dosyasına
+  zaman damgalı `REPLAY?` notu olarak düşülür (teşhis amaçlı, CSV
+  şemasını etkilemez).
 
 ## Teknik kontrol provası (60 sn anten sök-tak senaryosu)
 
@@ -100,13 +114,18 @@ Yönetmelik teknik kontrolünde jüriye gösterilecek prova adımları:
      satırı görülür.
    - **Dosya adı DEĞİŞMEMİŞ olmalı** — kayıt aynı `telem_YYYYMMDD_HHMMSS.csv`
      dosyasında devam eder.
-5. **Dosyada beklenen ts deseni:** Kopma sırasında AKS tarafında biriken
-   paketler yeniden bağlanınca "replay" edilir — AKS logunda buna karşılık
-   gelen "`N paket, ts [a..b] replay ediliyor`" satırıyla eşleşecek şekilde,
-   `zaman_ms` kolonu geçici olarak GERİYE döner (kopma anındaki `ts`'den
-   daha eski değerler), sonra tekrar canlı akışa yakalanıp ileri gitmeye
-   devam eder. Bu, `seq` sütununun (dosyada tutulmaz, ama sıralama mantığının
-   dayandığı alan) sürekli ARTAN kalmasıyla ayırt edilir — dolayısıyla YENİ
-   BOOT tespit edilmez ve tek dosyada kesintisiz kayıt sağlanır.
+5. **Dosyada beklenen ts deseni (9.2.e):** Kopma sırasında AKS tarafında
+   biriken paketler yeniden bağlanınca "fermuar" yöntemiyle (1 canlı + en
+   fazla 1 tamponlanmış paket / verici turu) replay edilir. Bu yüzden
+   `zaman_ms` kolonu drenaj süresince geçici olarak GERİYE döner (kopma
+   anındaki `ts`'den daha eski değerler), sonra tekrar canlı akışa
+   yakalanıp ileri gitmeye devam eder — bu, jüriye gösterilecek **beklenen
+   ve şartnameye uygun** bir desendir, hata değildir. Bu, `seq` sütununun
+   (dosyada tutulmaz, ama sıralama mantığının dayandığı alan) sürekli
+   ARTAN kalmasıyla ayırt edilir — dolayısıyla YENİ BOOT tespit edilmez ve
+   tek dosyada kesintisiz kayıt sağlanır. Her replay tespiti ayrıca
+   `logs/events_*.log` dosyasına zaman damgalı `REPLAY?` notuyla düşülür.
 
-Bu senaryonun otomatik testi: `tests/test_monitor_serial.py::test_serial_disconnect_reconnect_same_file_no_row_loss`.
+Bu senaryonun otomatik testleri:
+`tests/test_monitor_serial.py::test_serial_disconnect_reconnect_same_file_no_row_loss`
+ve `tests/test_monitor_serial.py::test_replay_ts_regression_logs_tag_without_touching_csv_schema`.
