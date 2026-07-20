@@ -1,6 +1,7 @@
 """TUFAN İzleme Merkezi - ana uygulama (seri okuma + CSV yazma + GUI)."""
 
 import argparse
+import bisect
 import os
 import queue
 import threading
@@ -27,6 +28,53 @@ from csv_logger import (
 LINK_TIMEOUT_SEC = 3.0
 GUI_POLL_MS = 200
 RECONNECT_INTERVAL_SEC = 2.0  # 9.2.h: port kopunca 2 sn'de bir yeniden bağlanma denenir
+
+# R2 (9.2.e/9.2.h): grafik çizgisi, henüz replay ile doldurulmamış >5 sn'lik
+# bir boşlukta KESİLİR (düz-çizgi ile "veri var" yanılsaması verilmez) —
+# _refresh_interval_indicator'daki aynı 5.0 sn eşiğiyle tutarlı.
+GRAPH_GAP_BREAK_SEC = 5.0
+
+
+def insert_sorted_point(history, point):
+    """(ts_sec, value) noktasini history'e ts_sec'e göre SIRALI ekler
+    (bisect.insort) — geliş sırası yerine zaman damgasına göre; böylece geç
+    gelen replay noktaları (eski ts_sec) grafik üzerinde doğru (geçmiş)
+    konuma yerleşir, sona değil. Saf fonksiyon — tkinter/matplotlib'e
+    dokunmaz, doğrudan test edilebilir."""
+    bisect.insort(history, point)
+
+
+def trim_history_window(history, window_sec):
+    """SIRALI (ts_sec, value) listesinden, en yeni ts_sec'ten window_sec'ten
+    daha eskiye düşen noktaları atar. Pencere en yeni BİLİNEN telemetri
+    zaman damgasına göredir (duvar-saati "şimdi"ye göre DEĞİL) — bir kesinti
+    sırasında telemetri ts'si ilerlemese de (offline örnekleme sürer ama
+    henüz replay edilmediyse grafik güncellenmez) pencere sabit kalır;
+    replay geldiğinde en yeni ts ilerler ve pencere onunla birlikte kayar."""
+    if not history:
+        return history
+    cutoff = history[-1][0] - window_sec
+    return [(t, v) for t, v in history if t >= cutoff]
+
+
+def build_line_with_gaps(history, gap_threshold_sec=GRAPH_GAP_BREAK_SEC):
+    """SIRALI (ts_sec, value) listesinden matplotlib çizgi verisi üretir;
+    ardışık iki nokta arasındaki ts farkı gap_threshold_sec'i aşarsa aralarına
+    bir (NaN, NaN) kırılma noktası eklenir — matplotlib bu noktada çizgiyi
+    ÇİZMEZ (boşluk görünür kalır). Replay paketleri geldikçe insert_sorted_point
+    ile araya yeni noktalar girer, sonraki çağrıda boşluk küçülür/dolar. Saf
+    fonksiyon — doğrudan test edilebilir."""
+    xs: list[float] = []
+    ys: list[float] = []
+    prev_ts = None
+    for ts_sec, value in history:
+        if prev_ts is not None and (ts_sec - prev_ts) > gap_threshold_sec:
+            xs.append(float("nan"))
+            ys.append(float("nan"))
+        xs.append(ts_sec)
+        ys.append(value)
+        prev_ts = ts_sec
+    return xs, ys
 
 
 def _simulate_suffix():
@@ -57,41 +105,79 @@ def open_events_log():
 
 
 class MockSerial:
+    """SIMULATE modu için sahte AKS seri veri kaynağı.
+
+    R2 (9.2.e/9.2.h): periyodik olarak GERÇEKÇİ bir kesinti + replay
+    senaryosu üretir — LINK,DOWN -> OUTAGE_TICKS sn boyunca hiçbir satır
+    gelmez (b"" — gerçek RF kesintisinde olduğu gibi) -> LINK,UP -> geriye
+    dönük (backdated) ts'li bir replay burst'ü -> canlıya dönüş. Böylece
+    Monitor'un sıralı-ekleme + boşluk-kırma (gap-break) grafik davranışı
+    `python monitor.py` (SIMULATE modu, gerçek COM portu gerektirmez) ile
+    gözle görülür şekilde denenebilir (bkz. Documents/LoRa_Link_Analysis.md
+    "Bench Prosedürü").
+    """
+
+    OUTAGE_EVERY_N_TICKS = 40
+    OUTAGE_TICKS = 8  # ~8 sn'lik kesinti (LINK_TIMEOUT_MS'e yakın, kısa demo)
+
     def __init__(self):
         self.seq = 0
         self.start_time = time.time()
         self.speed = 50.0
         self.soc = 90.0
         self.temp = 35
+        self._tick = 0
+        self._mode = "live"  # "live" | "offline" | "draining"
+        self._offline_backlog = []  # (elapsed_ms, speed, temp, soc, seq)
 
-    def readline(self):
-        time.sleep(1.0)  # 1 saniye aralıklarla veri simüle et
-        elapsed_ms = int((time.time() - self.start_time) * 1000)
-        self.seq += 1
-        
+    def _advance_sensors(self):
         import random
         self.speed += random.uniform(-3, 3)
         self.speed = max(0, min(config.MAX_SPEED_KMH - 20, self.speed))
-        
+
         self.temp += random.choice([-1, 0, 1])
         self.temp = max(20, min(65, self.temp))
-        
+
         self.soc -= 0.05
         self.soc = max(0, self.soc)
-        
-        voltage = 45.0 + (self.soc / 100.0) * 8.0
-        
-        speed_x10 = int(self.speed * 10)
+
+    def _build_csv_line(self, elapsed_ms, speed, temp, soc, seq):
+        voltage = 45.0 + (soc / 100.0) * 8.0
+        speed_x10 = int(speed * 10)
         voltage_deciv = int(voltage * 10)
-        soc_hundredths = int(self.soc * 100)
-        
-        # Rastgele LINK durumları
-        if self.seq % 40 == 0:
-            return b"LINK,DOWN\r\n"
-        elif self.seq % 42 == 0:
+        soc_hundredths = int(soc * 100)
+        return f"CSV,{elapsed_ms},{speed_x10},{temp},{voltage_deciv},{soc_hundredths},{seq}\r\n".encode("utf-8")
+
+    def readline(self):
+        time.sleep(1.0)  # 1 saniye aralıklarla veri simüle et
+        self._tick += 1
+
+        if self._mode == "draining" and self._offline_backlog:
+            r_ms, r_speed, r_temp, r_soc, r_seq = self._offline_backlog.pop(0)
+            if not self._offline_backlog:
+                self._mode = "live"
+            return self._build_csv_line(r_ms, r_speed, r_temp, r_soc, r_seq)
+
+        elapsed_ms = int((time.time() - self.start_time) * 1000)
+        self._advance_sensors()
+
+        if self._mode == "live":
+            if self._tick % self.OUTAGE_EVERY_N_TICKS == 0:
+                self._mode = "offline"
+                self._offline_backlog = []
+                return b"LINK,DOWN\r\n"
+            self.seq += 1
+            return self._build_csv_line(elapsed_ms, self.speed, self.temp, self.soc, self.seq)
+
+        # self._mode == "offline": RF fiilen kesik — canlı TX YOK (readline
+        # boş döner, gerçek bir kablo/menzil kopmasında olduğu gibi), ama
+        # AKS yerel olarak (offline buffer) örneklemeye devam eder.
+        self.seq += 1
+        self._offline_backlog.append((elapsed_ms, self.speed, self.temp, self.soc, self.seq))
+        if len(self._offline_backlog) >= self.OUTAGE_TICKS:
+            self._mode = "draining"
             return b"LINK,UP\r\n"
-            
-        return f"CSV,{elapsed_ms},{speed_x10},{self.temp},{voltage_deciv},{soc_hundredths},{self.seq}\r\n".encode('utf-8')
+        return b""
 
     def close(self):
         pass
@@ -198,6 +284,10 @@ def serial_worker(data_queue, stop_event, connect=open_serial_connection,
                     log_file.close()
                     log_file, filename = open_log_file()
                     data_queue.put({"type": "filename", "name": filename})
+                    # R2: yeni boot -> ts_ms sıfırdan başlar; GUI grafiği
+                    # (ts_ms tabanlı x ekseni) eski boot'un yüksek ts'leriyle
+                    # karışmasın diye temizlenmeli.
+                    data_queue.put({"type": "new_boot"})
                     log_event(f"YENI BOOT tespit edildi -> {filename}")
                     print(f"YENİ BOOT tespit edildi → {filename}")
                 elif is_replay_ts(prev_ts_ms, curr_ts_ms):
@@ -213,6 +303,17 @@ def serial_worker(data_queue, stop_event, connect=open_serial_connection,
                 prev_seq = curr_seq
                 prev_ts_ms = curr_ts_ms
 
+                # R2 KARAR: CSV satırları GELİŞ SIRASIYLA yazılmaya devam
+                # eder (replay ts'si eski olsa bile dosyada sonra görünür) —
+                # şartname (9.2.e/9.2.h) satırların dosyada ts_ms'e göre
+                # SIRALI olmasını ŞART KOŞMUYOR, yalnızca kesinti aralığının
+                # ts damgalarıyla (herhangi bir sırada) MEVCUT olmasını
+                # istiyor. Sıra bilgisi zaten zaman damgasının (ts_ms, ilk
+                # kolon) kendisinde var — jüri/analiz sort ederek okuyabilir.
+                # Grafik (GUI) ise ts_sec'e göre sıralı ekler (bkz.
+                # insert_sorted_point) çünkü ORADA çizgi süreklidiği için
+                # geliş sırası YETERSİZ kalır; CSV dosyası için bu gerekçe
+                # geçerli değil.
                 record = format_record(parsed, config.BATTERY_CAPACITY_WH)
                 log_file.write(record + "\n")
                 # 9.2.g: kayıt kanıt niteliğindedir — çökme anında veri
@@ -225,6 +326,12 @@ def serial_worker(data_queue, stop_event, connect=open_serial_connection,
                     {
                         "type": "csv",
                         "ts": time.monotonic(),
+                        # R2: paketin KENDİ zaman damgası (AKS ts_ms, sn) —
+                        # grafik x ekseni artık VARIŞ sırası/zamanı yerine bunu
+                        # kullanır (geç gelen replay noktaları doğru yere
+                        # yerleşsin diye). "ts" (yukarıda, wall-clock varış)
+                        # yalnız bağlantı sağlık göstergeleri için kalır.
+                        "ts_sec": curr_ts_ms / 1000.0,
                         "speed_kmh": parsed["speed_kmh_x10"] / 10,
                         "temp_c": parsed["temp_c"],
                         "voltage_v": parsed["pack_voltage_deciv"] / 10,
@@ -382,7 +489,10 @@ class MonitorApp:
         self.packet_count = 0
         self.last_packet_time = None
         self.start_time = time.monotonic()
-        self.speed_history = []  # [(t_sn, hiz_kmh), ...]
+        # R2: [(ts_sec, hiz_kmh), ...] — ts_sec paketin KENDİ zaman damgası
+        # (AKS ts_ms/1000), varış sırası/zamanı DEĞİL; insert_sorted_point
+        # ile her zaman ts_sec'e göre SIRALI tutulur (bkz. update_gui).
+        self.speed_history = []
 
         self.port_connected = True  # ilk bağlanma denemesi sonucu ilk mesajla güncellenir
         self.link_connected = False
@@ -566,7 +676,10 @@ class MonitorApp:
                 self.energy_card.set_value(msg['energy_wh'])
                 self.packet_label.config(text=f"Alınan paket: {self.packet_count}")
 
-                self.speed_history.append((msg["ts"] - self.start_time, msg["speed_kmh"]))
+                # R2: geliş sırası yerine paketin KENDİ ts_sec'ine göre sıralı
+                # ekle — geç gelen replay noktaları (eski ts_sec) grafikte
+                # doğru (geçmiş) konuma yerleşsin, listenin sonuna değil.
+                insert_sorted_point(self.speed_history, (msg["ts_sec"], msg["speed_kmh"]))
                 self.link_connected = True
 
             elif msg_type == "link_down":
@@ -586,15 +699,19 @@ class MonitorApp:
             elif msg_type == "filename":
                 self.file_label.config(text=f"● KAYIT AKTİF: logs/{os.path.basename(msg['name'])}", fg="#10B981")
 
+            elif msg_type == "new_boot":
+                # R2: yeni boot -> ts_ms sıfırdan başlar; eski boot'un yüksek
+                # ts'leriyle aynı grafikte karışmasın diye pencere temizlenir.
+                self.speed_history.clear()
+
         if self.last_packet_time is not None and (now - self.last_packet_time) > LINK_TIMEOUT_SEC:
             self.link_connected = False
 
         self._refresh_status_badge()
         self._refresh_interval_indicator(now)
 
-        cutoff = (now - self.start_time) - config.GRAPH_WINDOW_SEC
-        self.speed_history = [(t, v) for t, v in self.speed_history if t >= cutoff]
-        self._redraw_graph(now - self.start_time)
+        self.speed_history = trim_history_window(self.speed_history, config.GRAPH_WINDOW_SEC)
+        self._redraw_graph()
 
         self.root.after(GUI_POLL_MS, self.update_gui)
 
@@ -612,14 +729,20 @@ class MonitorApp:
         else:
             self.interval_label.config(bg=self._default_interval_bg, fg="#94A3B8")
 
-    def _redraw_graph(self, t_now):
+    def _redraw_graph(self):
+        # R2: x ekseni artık paketlerin KENDİ ts_sec'i (AKS telemetri zaman
+        # damgası) — duvar-saati/varış zamanı DEĞİL. self.speed_history
+        # insert_sorted_point ile sürekli ts_sec'e göre sıralı tutulur; bu
+        # yüzden en yeni BİLİNEN ts, listenin SON elemanıdır.
         if self.speed_history:
-            xs, ys = zip(*self.speed_history)
+            xs, ys = build_line_with_gaps(self.speed_history)
             self.speed_line.set_data(xs, ys)
+            t_latest = self.speed_history[-1][0]
         else:
             self.speed_line.set_data([], [])
+            t_latest = 0.0
 
-        self.ax.set_xlim(max(0, t_now - config.GRAPH_WINDOW_SEC), max(t_now, config.GRAPH_WINDOW_SEC))
+        self.ax.set_xlim(max(0, t_latest - config.GRAPH_WINDOW_SEC), max(t_latest, config.GRAPH_WINDOW_SEC))
         self.canvas.draw_idle()
 
     def on_close(self):

@@ -320,6 +320,79 @@ def test_real_port_mode_log_filenames_have_no_sim_suffix(tmp_path, monkeypatch):
     assert not events_files[0].name.endswith("_SIM.log")
 
 
+def test_csv_messages_carry_ts_sec_from_packet_timestamp(tmp_path, monkeypatch):
+    """R2: 'csv' mesajı artık grafiğin sıralı-ekleme için kullandığı
+    'ts_sec' alanını (paketin KENDİ ts_ms'i / 1000) taşımalı — varış
+    zamanından (wall-clock 'ts') BAĞIMSIZ, replay/canlı fark etmeksizin."""
+    monkeypatch.chdir(tmp_path)
+
+    batch = [
+        csv_line(50000, 300, 32, 780, 6283, 100),
+        csv_line(49500, 300, 32, 780, 6283, 101),  # replay: eski ts
+    ]
+    connect = scripted_connect_factory([batch])
+
+    data_queue = queue.Queue()
+    stop_event = threading.Event()
+
+    worker = threading.Thread(
+        target=monitor.serial_worker,
+        args=(data_queue, stop_event),
+        kwargs={"connect": connect, "reconnect_interval": 0.02},
+        daemon=True,
+    )
+    worker.start()
+
+    messages = drain_until(data_queue, "csv", 2)
+    stop_event.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    csv_messages = [m for m in messages if m["type"] == "csv"]
+    assert [m["ts_sec"] for m in csv_messages] == [50.0, 49.5], (
+        "ts_sec, paketin KENDİ ts_ms'inden (varış sırasından DEĞİL) "
+        "türetilmeli — replay paketi burada ikinci sırada gelse de ts_sec "
+        "geriye gitmeli (49.5 < 50.0)"
+    )
+
+
+def test_new_boot_message_emitted_on_real_boot_not_on_replay(tmp_path, monkeypatch):
+    """R2: GUI grafiğinin ts_ms tabanlı penceresini temizleyebilmesi için,
+    'new_boot' mesajı YALNIZ gerçek yeni-boot tespitinde (seq geriye
+    sıçradığında) yayınlanmalı — bir replay (ts geriye, seq ileri) BUNU
+    TETİKLEMEMELİ (aksi halde grafik replay sırasında yanlışlıkla temizlenir)."""
+    monkeypatch.chdir(tmp_path)
+
+    batch = [
+        csv_line(100000, 300, 32, 780, 6283, 100),
+        csv_line(41000, 300, 32, 780, 6283, 101),   # replay: ts geriye, seq ileri
+        csv_line(1200, 300, 32, 780, 6283, 0),        # gercek yeni boot: seq geriye
+    ]
+    connect = scripted_connect_factory([batch])
+
+    data_queue = queue.Queue()
+    stop_event = threading.Event()
+
+    worker = threading.Thread(
+        target=monitor.serial_worker,
+        args=(data_queue, stop_event),
+        kwargs={"connect": connect, "reconnect_interval": 0.02},
+        daemon=True,
+    )
+    worker.start()
+
+    messages = drain_until(data_queue, "csv", 3)
+    stop_event.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    new_boot_count = sum(1 for m in messages if m["type"] == "new_boot")
+    assert new_boot_count == 1, (
+        f"new_boot tam olarak 1 kez (gercek boot'ta) yayinlanmali, "
+        f"gorulen: {new_boot_count}"
+    )
+
+
 def test_simulate_mode_new_boot_second_file_also_carries_sim_suffix(tmp_path, monkeypatch):
     """Yeni-boot tespitinde serial_worker dosyayi kapatip open_log_file ile
     yeniden aciyor; SIMULATE modunda ikinci dosya da _SIM eki tasimali."""
