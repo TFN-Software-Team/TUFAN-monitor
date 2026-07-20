@@ -1,8 +1,10 @@
 import locale
 import os
+from datetime import datetime
 
 import pytest
 
+import csv_logger
 from csv_logger import (
     HEADER,
     detect_new_boot,
@@ -10,6 +12,7 @@ from csv_logger import (
     format_record,
     is_replay_ts,
     make_events_log_filename,
+    make_log_filename,
     parse_csv_line,
 )
 
@@ -135,7 +138,109 @@ def test_make_events_log_filename_pattern(tmp_path, monkeypatch):
     assert os.path.dirname(filename) == "logs"
     assert os.path.basename(filename).startswith("events_")
     assert filename.endswith(".log")
+    assert not os.path.basename(filename).endswith("_SIM.log")
     assert (tmp_path / "logs").is_dir()
+
+
+def test_make_log_filename_default_pattern_unchanged(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    filename = make_log_filename()
+    assert os.path.dirname(filename) == "logs"
+    assert os.path.basename(filename).startswith("telem_")
+    assert filename.endswith(".csv")
+    assert not os.path.basename(filename).endswith("_SIM.csv")
+
+
+def test_make_log_filename_with_sim_suffix(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    filename = make_log_filename(suffix="_SIM")
+    assert os.path.basename(filename).startswith("telem_")
+    assert filename.endswith("_SIM.csv")
+
+
+def test_make_events_log_filename_with_sim_suffix(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    filename = make_events_log_filename(suffix="_SIM")
+    assert os.path.basename(filename).startswith("events_")
+    assert filename.endswith("_SIM.log")
+
+
+class _FixedDatetime(datetime):
+    """datetime.now() sabit bir deger dondursun diye monkeypatch icin."""
+
+    _fixed = datetime(2026, 7, 13, 14, 15, 30)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._fixed
+
+
+def test_make_log_filename_same_second_collision_gets_counter_suffix(tmp_path, monkeypatch):
+    # 9.2.g: ayni saniyede ikinci bir new-boot yeniden-acilisi ayni ismi
+    # uretmemeli -- ilk dosyanin icerigi (mevcut kayit) sessizce
+    # sifirlanmamali (truncate). make_log_filename saniye-cozunurluklu
+    # saate ragmen benzersiz bir isim garanti etmeli.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(csv_logger, "datetime", _FixedDatetime)
+
+    filename1 = make_log_filename()
+    with open(filename1, "x", encoding="utf-8") as f:
+        f.write(HEADER + "\ntelem-1-icerigi\n")
+
+    filename2 = make_log_filename()
+
+    assert filename1 != filename2, "ayni saniyede uretilen ikinci isim ilkiyle CAKISMAMALI"
+    assert os.path.basename(filename1) == "telem_20260713_141530.csv"
+    assert os.path.basename(filename2) == "telem_20260713_141530_2.csv"
+
+    # ikinci cagri, ilk dosyaya hic dokunmamis olmali (icerik korunmus).
+    with open(filename1, encoding="utf-8") as f:
+        assert f.read() == HEADER + "\ntelem-1-icerigi\n"
+    assert not os.path.exists(filename2), "make_log_filename dosyayi kendisi olusturmamali, yalniz ismi hesaplamali"
+
+    # filename2 henuz diskte olusturulmadigi icin ayni ismi tekrar dondurur
+    # (make_log_filename saf bir isim hesaplayicidir, dosyayi kendisi
+    # yaratmaz) -- once onu da olustur, sonra ucuncu cagrinin _3'e
+    # atladigini dogrula.
+    with open(filename2, "x", encoding="utf-8"):
+        pass
+    filename3 = make_log_filename()
+    assert filename3 not in (filename1, filename2)
+    assert os.path.basename(filename3) == "telem_20260713_141530_3.csv"
+
+
+def test_make_log_filename_sim_suffix_collision_counter_order(tmp_path, monkeypatch):
+    # suffix (_SIM) sayac ekinden ONCE gelmeli: telem_..._SIM_2.csv,
+    # telem_..._2_SIM.csv DEGIL.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(csv_logger, "datetime", _FixedDatetime)
+
+    filename1 = make_log_filename(suffix="_SIM")
+    with open(filename1, "x", encoding="utf-8"):
+        pass
+
+    filename2 = make_log_filename(suffix="_SIM")
+
+    assert os.path.basename(filename1) == "telem_20260713_141530_SIM.csv"
+    assert os.path.basename(filename2) == "telem_20260713_141530_SIM_2.csv"
+
+
+def test_make_events_log_filename_same_second_collision_gets_counter_suffix(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(csv_logger, "datetime", _FixedDatetime)
+
+    filename1 = make_events_log_filename()
+    with open(filename1, "x", encoding="utf-8") as f:
+        f.write("olay-1-icerigi\n")
+
+    filename2 = make_events_log_filename()
+
+    assert filename1 != filename2
+    assert os.path.basename(filename1) == "events_20260713_141530.log"
+    assert os.path.basename(filename2) == "events_20260713_141530_2.log"
+
+    with open(filename1, encoding="utf-8") as f:
+        assert f.read() == "olay-1-icerigi\n"
 
 
 def test_format_event_line_has_timestamp_prefix_and_message():

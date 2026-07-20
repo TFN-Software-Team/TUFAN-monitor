@@ -1,6 +1,11 @@
 """TUFAN İzleme Merkezi - ayarlar."""
 
-SERIAL_PORT = "SIMULATE"          # kullanıcı değiştirir ("SIMULATE" veya "COM3" / "/dev/cu.usbserial-xxx")
+# Varsayılanın "SIMULATE" mi yoksa gerçek bir port mu olacağı EKİBE ait bir
+# karardır — bu değişiklikte varsayılan bilerek DEĞİŞTİRİLMEDİ. SIMULATE
+# modunda üretilen dosyalar "_SIM" ekiyle (telem_..._SIM.csv,
+# events_..._SIM.log) ve pencere başlığındaki kalıcı uyarıyla gerçek
+# kayıttan ayrıştığından, varsayılanı SIMULATE bırakmak artık güvenli.
+SERIAL_PORT = "COM5"          # kullanıcı değiştirir ("SIMULATE" veya "COM3" / "/dev/cu.usbserial-xxx")
 SERIAL_BAUD = 115200          # UKS USART1 baud hızı
 
 # 9.2.f: izleme merkezi kaydında kalan_enerji_Wh kolonu zorunludur.

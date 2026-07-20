@@ -1,5 +1,6 @@
 """TUFAN İzleme Merkezi - ana uygulama (seri okuma + CSV yazma + GUI)."""
 
+import argparse
 import os
 import queue
 import threading
@@ -9,6 +10,7 @@ import tkinter as tk
 import serial
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from serial.tools import list_ports
 
 import config
 from csv_logger import (
@@ -27,10 +29,22 @@ GUI_POLL_MS = 200
 RECONNECT_INTERVAL_SEC = 2.0  # 9.2.h: port kopunca 2 sn'de bir yeniden bağlanma denenir
 
 
+def _simulate_suffix():
+    """SIMULATE modunda sahte veri dosyalarını gerçek kayıttan ayırmak için
+    dosya adı eki. Tek noktadan çözülür: open_log_file/open_events_log
+    çağıran her yer (ilk açılış ve yeni-boot sonrası yeniden açılış dahil)
+    bunu otomatik alır."""
+    return "_SIM" if config.SERIAL_PORT == "SIMULATE" else ""
+
+
 def open_log_file():
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    filename = make_log_filename()
-    f = open(filename, "w", encoding="utf-8")
+    filename = make_log_filename(suffix=_simulate_suffix())
+    # "x" (exclusive create): make_log_filename zaten diskteki isim
+    # çakışmalarını sayaç ekiyle önler; bu sadece savunma katmanıdır --
+    # isim üretimi bir şekilde bozulup mevcut bir dosyayla çakışırsa "w"
+    # gibi sessizce sıfırlamak (truncate) yerine FileExistsError fırlatır.
+    f = open(filename, "x", encoding="utf-8")
     f.write(HEADER + "\n")
     f.flush()
     return f, filename
@@ -38,7 +52,7 @@ def open_log_file():
 
 def open_events_log():
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    filename = make_events_log_filename()
+    filename = make_events_log_filename(suffix=_simulate_suffix())
     return open(filename, "a", encoding="utf-8")
 
 
@@ -117,6 +131,12 @@ def serial_worker(data_queue, stop_event, connect=open_serial_connection,
             "UYARI: BATARYA KAPASITESI TEYITSIZ — kalan_enerji_Wh kolonu "
             "gecersiz (config.py: CONFIG_CONFIRMED=False)"
         )
+    if config.SERIAL_PORT == "SIMULATE":
+        print(
+            "UYARI: SIMULATE modu aktif — uretilen tum veri SAHTEDIR, "
+            "gercek kayit icin config.py SERIAL_PORT'u gercek COM portuna cevirin "
+            "veya --port COMx ile calistirin"
+        )
 
     prev_seq = None
     prev_ts_ms = None
@@ -159,10 +179,9 @@ def serial_worker(data_queue, stop_event, connect=open_serial_connection,
             if not raw:
                 continue
 
-            try:
-                line = raw.decode("utf-8", errors="ignore").strip()
-            except UnicodeDecodeError:
-                continue
+            # errors="ignore" hicbir zaman UnicodeDecodeError firlatmaz,
+            # bu yuzden try/except gerekmez.
+            line = raw.decode("utf-8", errors="ignore").strip()
 
             if not line:
                 continue
@@ -347,6 +366,11 @@ class MonitorApp:
             # eder, ama teyitsiz kapasite pencere başlığında KALICI olarak
             # görünür kalır (tek satırlık konsol uyarısı gözden kaçabilir).
             title += " [BATARYA KAPASITESI TEYITSIZ — kalan_enerji_Wh gecersiz]"
+        if config.SERIAL_PORT == "SIMULATE":
+            # SIMULATE modunda uretilen veri sahte — bu da CONFIG_CONFIRMED
+            # uyarisiyla ayni kalicilikta baslikta gorunur kalmali (ikisi
+            # ayni anda gecerliyse ikisi de eklenir).
+            title += " [SİMÜLASYON — GERÇEK VERİ DEĞİL]"
         self.root.title(title)
         self.root.geometry("1020x600")
         self.root.minsize(960, 520)
@@ -603,7 +627,54 @@ class MonitorApp:
         self.root.destroy()
 
 
+def parse_args(argv=None):
+    """CLI argumanlarini ayristirir. --port verilirse config.py'deki
+    SERIAL_PORT degerini ezer (bkz. resolve_serial_port)."""
+    parser = argparse.ArgumentParser(description="TUFAN İzleme Merkezi")
+    parser.add_argument(
+        "--port",
+        default=None,
+        help="Seri port (orn. COM5, /dev/cu.usbserial-xxx). Verilirse "
+        "config.py'deki SERIAL_PORT degerini ezer.",
+    )
+    return parser.parse_args(argv)
+
+
+def resolve_serial_port(cli_port, config_port):
+    """--port CLI argumani ile config.SERIAL_PORT arasinda oncelik cozer:
+    CLI verilmisse (None degilse) o kazanir, aksi halde config degeri
+    aynen kullanilir. Saf fonksiyon -- argparse/tkinter/config'e dokunmadan
+    test edilebilir."""
+    return cli_port if cli_port is not None else config_port
+
+
+def list_available_ports():
+    """Sistemde gorunen seri portlarin device adlarini dondurur (pyserial
+    list_ports sarmalayicisi); gercek donanim gerektirdiginden ayri bir
+    fonksiyonda tutulur ki cagiran taraf (main) testte kolayca mock'layabilsin."""
+    return [p.device for p in list_ports.comports()]
+
+
+def format_port_list_message(ports):
+    """list_available_ports() ciktisini konsola basilacak insan-okunur bir
+    metne cevirir; saf fonksiyon oldugu icin gercek donanim/pyserial
+    olmadan test edilebilir."""
+    if not ports:
+        return "Sistemde seri port bulunamadi."
+    return "Bulunan seri portlar: " + ", ".join(ports)
+
+
 def main():
+    args = parse_args()
+    original_port = config.SERIAL_PORT
+    config.SERIAL_PORT = resolve_serial_port(args.port, original_port)
+
+    if args.port is None and original_port == "SIMULATE":
+        # 2: --port verilmemis VE config SIMULATE ise, gercek kayda
+        # gecebilmek icin mevcut portlari listele.
+        print(format_port_list_message(list_available_ports()))
+        print("Gercek kayit icin --port COMx verin (orn. python monitor.py --port COM5).")
+
     root = tk.Tk()
     MonitorApp(root)
     root.mainloop()

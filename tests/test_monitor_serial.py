@@ -5,12 +5,14 @@ Gercek pyserial/donanim kullanilmaz; monitor.serial_worker'a `connect`
 parametresiyle sahte bir baglanti fabrikasi enjekte edilir.
 """
 
+import os
 import queue
 import threading
 import time
 
 import serial
 
+import config
 import monitor
 from csv_logger import HEADER
 
@@ -250,3 +252,125 @@ def test_link_down_up_lines_not_written_to_csv(tmp_path, monkeypatch):
     events_text = next(iter(events_content)).read_text(encoding="utf-8")
     assert "LINK,DOWN" in events_text
     assert "LINK,UP" in events_text
+
+
+def test_simulate_mode_log_filenames_carry_sim_suffix(tmp_path, monkeypatch):
+    """config.SERIAL_PORT == "SIMULATE" iken hem telem hem events dosyasi
+    _SIM ile bitmeli — sahte veri gercek kayitla asla karismamali."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config, "SERIAL_PORT", "SIMULATE")
+
+    batch = [csv_line(1000, 100, 25, 750, 9000, 1)]
+    connect = scripted_connect_factory([batch])
+
+    data_queue = queue.Queue()
+    stop_event = threading.Event()
+
+    worker = threading.Thread(
+        target=monitor.serial_worker,
+        args=(data_queue, stop_event),
+        kwargs={"connect": connect, "reconnect_interval": 0.02},
+        daemon=True,
+    )
+    worker.start()
+
+    drain_until(data_queue, "csv", 1)
+    stop_event.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    telem_files = list((tmp_path / "logs").glob("telem_*.csv"))
+    events_files = list((tmp_path / "logs").glob("events_*.log"))
+    assert len(telem_files) == 1
+    assert len(events_files) == 1
+    assert telem_files[0].name.endswith("_SIM.csv")
+    assert events_files[0].name.endswith("_SIM.log")
+
+
+def test_real_port_mode_log_filenames_have_no_sim_suffix(tmp_path, monkeypatch):
+    """Gercek port modunda davranis birebir eskisi gibi olmali: dosya
+    adlarinda _SIM eki OLMAMALI."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config, "SERIAL_PORT", "COM99")
+
+    batch = [csv_line(1000, 100, 25, 750, 9000, 1)]
+    connect = scripted_connect_factory([batch])
+
+    data_queue = queue.Queue()
+    stop_event = threading.Event()
+
+    worker = threading.Thread(
+        target=monitor.serial_worker,
+        args=(data_queue, stop_event),
+        kwargs={"connect": connect, "reconnect_interval": 0.02},
+        daemon=True,
+    )
+    worker.start()
+
+    drain_until(data_queue, "csv", 1)
+    stop_event.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    telem_files = list((tmp_path / "logs").glob("telem_*.csv"))
+    events_files = list((tmp_path / "logs").glob("events_*.log"))
+    assert len(telem_files) == 1
+    assert len(events_files) == 1
+    assert not telem_files[0].name.endswith("_SIM.csv")
+    assert not events_files[0].name.endswith("_SIM.log")
+
+
+def test_simulate_mode_new_boot_second_file_also_carries_sim_suffix(tmp_path, monkeypatch):
+    """Yeni-boot tespitinde serial_worker dosyayi kapatip open_log_file ile
+    yeniden aciyor; SIMULATE modunda ikinci dosya da _SIM eki tasimali."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config, "SERIAL_PORT", "SIMULATE")
+
+    batch = [
+        csv_line(100000, 300, 32, 780, 6283, 100),
+        csv_line(1200, 300, 32, 780, 6283, 0),  # seq geriye siçradi -> yeni boot
+    ]
+    connect = scripted_connect_factory([batch])
+
+    data_queue = queue.Queue()
+    stop_event = threading.Event()
+
+    worker = threading.Thread(
+        target=monitor.serial_worker,
+        args=(data_queue, stop_event),
+        kwargs={"connect": connect, "reconnect_interval": 0.02},
+        daemon=True,
+    )
+    worker.start()
+
+    messages = drain_until(data_queue, "csv", 2)
+    stop_event.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    filenames = [m["name"] for m in messages if m["type"] == "filename"]
+    assert len(filenames) == 2, "yeni boot ikinci bir dosya actirmali (open_log_file iki kez cagrilmali)"
+    assert filenames[0] != filenames[1], (
+        "9.2.g: ayni saniyede uretilen ikinci dosya adi ilkiyle CAKISMAMALI "
+        "(cakisirsa 'w' ile acilan ikinci dosya ilkini sessizce sifirlar)"
+    )
+    for name in filenames:
+        # Ayni saniyede acilan ikinci dosya sayac eki alabilir
+        # (telem_..._SIM_2.csv) -- _SIM'in varligi ve konumu (sayacdan
+        # ONCE) asil kontrol edilen sey, tam sonek degil.
+        assert "_SIM" in name and name.endswith(".csv"), "yeni boot sonrasi acilan dosya da _SIM eki tasimali"
+
+    # Mesaj adlari degil, bizzat diskteki dosyalari dogrula: iki AYRI dosya
+    # gercekten var olmali, ilk boot'un dosyasi ikinci acilis tarafindan
+    # sessizce sifirlanmamis (truncate edilmemis) olmali.
+    telem_files = sorted((tmp_path / "logs").glob("telem_*_SIM*.csv"))
+    assert len(telem_files) == 2, "iki ayri dosya diskte olmali (SIM eki + gerekirse sayac ile)"
+    assert {f.name for f in telem_files} == {os.path.basename(n) for n in filenames}
+    first_file = tmp_path / filenames[0]
+    first_lines = first_file.read_text(encoding="utf-8").splitlines()
+    assert first_lines[0] == HEADER
+    assert len(first_lines) == 1 + 1, (
+        "ilk boot dosyasi, yeni boot tespit edilmeden once yazilan seq=100 "
+        "kaydini icermeli; ikinci acilis tarafindan sessizce sifirlanmamis "
+        "(truncate edilmemis) olmali"
+    )

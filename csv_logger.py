@@ -40,11 +40,28 @@ def format_record(parsed: dict, battery_capacity_wh: float) -> str:
     return f"{timestamp_ms};{hiz_kmh:.1f};{t_bat_c};{v_bat_v:.1f};{kalan_enerji_wh}"
 
 
-def make_log_filename() -> str:
-    """PC tarih/saatine göre eşsiz bir log dosyası adı üretir; logs/ klasörünü oluşturur."""
+def _unique_path(directory: str, stem: str, extension: str) -> str:
+    """`directory/stem.extension` diskte zaten varsa `_2`, `_3`, ... sayaç
+    eki deneyerek diskte henüz bulunmayan bir yol döndürür. Aynı saniye
+    içinde art arda üretilen dosya adlarının çakışıp mevcut bir dosyayı
+    sessizce sıfırlamasını (truncate) önler."""
+    candidate = os.path.join(directory, f"{stem}{extension}")
+    counter = 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(directory, f"{stem}_{counter}{extension}")
+        counter += 1
+    return candidate
+
+
+def make_log_filename(suffix: str = "") -> str:
+    """PC tarih/saatine göre eşsiz bir log dosyası adı üretir; logs/ klasörünü
+    oluşturur. `suffix` (örn. "_SIM") uzantıdan ÖNCE eklenir; varsayılan ""
+    olduğundan mevcut çağrılar/dosya adı deseni etkilenmez. Aynı saniye
+    içinde ikinci bir çağrı yapılırsa (örn. new-boot yeniden-açılışı) `_2`,
+    `_3`, ... sayaç eki ile isim çakışması önlenir."""
     os.makedirs("logs", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return os.path.join("logs", f"telem_{timestamp}.csv")
+    return _unique_path("logs", f"telem_{timestamp}{suffix}", ".csv")
 
 
 def detect_new_boot(prev_seq: int | None, curr_seq: int) -> bool:
@@ -81,13 +98,16 @@ def is_replay_ts(prev_ts_ms: int | None, curr_ts_ms: int) -> bool:
     return curr_ts_ms < prev_ts_ms
 
 
-def make_events_log_filename() -> str:
+def make_events_log_filename(suffix: str = "") -> str:
     """PC tarih/saatine göre eşsiz bir olay (link/port durumu) log dosyası adı
     üretir; logs/ klasörünü oluşturur. CSV telemetri dosyasından ayrıdır ve
-    5 kolonlu CSV şemasını etkilemez."""
+    5 kolonlu CSV şemasını etkilemez. `suffix` (örn. "_SIM") uzantıdan ÖNCE
+    eklenir; varsayılan "" olduğundan mevcut çağrılar/dosya adı deseni
+    etkilenmez. Aynı saniye içinde ikinci bir çağrı yapılırsa `_2`, `_3`,
+    ... sayaç eki ile isim çakışması önlenir."""
     os.makedirs("logs", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return os.path.join("logs", f"events_{timestamp}.log")
+    return _unique_path("logs", f"events_{timestamp}{suffix}", ".log")
 
 
 def format_event_line(message: str, when: datetime | None = None) -> str:

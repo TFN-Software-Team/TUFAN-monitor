@@ -26,13 +26,45 @@ Durdurmak için `Ctrl+C` kullanın; açık dosya flush edilip kapatılır.
 `config.py` içinde `SERIAL_PORT` değerini bilgisayarınızdaki gerçek COM
 portuyla değiştirin (örn. `"COM5"`).
 
+Alternatif olarak `config.py`'yi hiç değiştirmeden, çalıştırırken
+`--port` ile geçici olarak COM portu verebilirsiniz — verilirse
+`config.SERIAL_PORT` değerini o oturum için ezer:
+
+```
+python monitor.py --port COM5
+```
+
+`--port` verilmez ve `config.py` içinde `SERIAL_PORT = "SIMULATE"` ise,
+uygulama başlangıçta sistemde görünen seri portları (pyserial
+`list_ports`) konsola listeler ve gerçek kayıt için `--port COMx`
+verilmesi gerektiğini hatırlatır.
+
+## SIMULATE modu
+
+`config.py` içinde `SERIAL_PORT = "SIMULATE"` iken uygulama gerçek bir
+seri porta bağlanmaz; `monitor.MockSerial` ile sahte telemetri paketleri
+üretir. Bu mod geliştirme/deneme amaçlıdır — üretilen veri GERÇEK DEĞİLDİR
+ve bu sessizce geçilmez:
+
+- Pencere başlığına kalıcı `[SİMÜLASYON — GERÇEK VERİ DEĞİL]` ibaresi
+  eklenir (CONFIG_CONFIRMED uyarısıyla aynı yerde; ikisi aynı anda
+  geçerliyse ikisi de görünür).
+- Konsola başlangıçta belirgin bir uyarı basılır.
+- O oturumda yazılan dosyalar `_SIM` ekiyle işaretlenir:
+  `logs/telem_YYYYMMDD_HHMMSS_SIM.csv` ve
+  `logs/events_YYYYMMDD_HHMMSS_SIM.log`. Yeni-boot tespiti sırasında
+  açılan ikinci (veya sonraki) dosyalar da bu eki taşır.
+
+**Gerçek kayıt veya jüri provası öncesi** `config.py` içindeki
+`SERIAL_PORT` değeri mutlaka gerçek COM portuna çevrilmelidir; aksi halde
+kaydedilen veri sahte olur.
+
 ## Batarya kapasitesi
 
 `config.py` içinde `BATTERY_CAPACITY_WH` değeri, kalan enerji (Wh)
-hesaplamasında kullanılır.
-
-**TODO:** Şu an yer tutucu bir değer (1000.0 Wh) içeriyor — ekip teknik
-şartnamesindeki gerçek batarya kapasitesi buraya girilmelidir.
+hesaplamasında kullanılır. Değer **8700.0 Wh** (100 Ah paket, nominal
+kapasite) olarak girilmiş ve batarya ekibi tarafından teyit edilmiştir
+(2026-07, bkz. `config.py: CONFIG_CONFIRMED = True`).
 
 ## Çıktı formatı
 
