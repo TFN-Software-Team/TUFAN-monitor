@@ -1,4 +1,10 @@
-logs/
+# MON-15 (madde 88): logs/ altindaki kayit dosyalari yok sayilir, ama repo
+# ile birlikte gitmesi gereken sabit bir okuma talimati dosyasi istisna
+# edilir. NOT: "logs/" (dizin) degil "logs/*" (icerik) kullanilir -- git
+# bir dizinin tamamini yok sayarsa, ic indeki tekil dosyalar icin negation
+# (!) kurallari calismaz (bkz. git-scm.com/docs/gitignore).
+logs/*
+!logs/OKUMA_TALIMATI.txt
 __pycache__/
 *.pyc
 .venv/

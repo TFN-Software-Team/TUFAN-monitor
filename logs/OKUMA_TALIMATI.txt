@@ -1,0 +1,55 @@
+TUFAN TELEMETRİ CSV DOSYALARI — OKUMA TALİMATI
+================================================
+
+Bu klasördeki telem_YYYYMMDD_HHMMSS.csv dosyaları ";" (noktalı virgül) ile
+ayrılmış ve ONDALIK AYRACI NOKTA ("." ) olan bir CSV biçimindedir.
+
+*** ÖNEMLİ: DOSYAYA ÇİFT TIKLAMAYIN ***
+
+Windows'ta bir .csv dosyasına çift tıklamak, dosyayı sistem bölgesel
+ayarlarınıza (örn. Türkçe Windows'ta ondalık ayracı VİRGÜLDÜR) göre AÇAR.
+Bu durumda Excel, "78.0" gibi bir değeri TEK BİR SAYI olarak değil, hatalı
+şekilde yorumlayabilir (sütunlar kayabilir, sayılar metne dönüşebilir).
+Bu HATALI bir görünümdür — dosyanın kendisi bozuk değildir.
+
+DOĞRU AÇMA YÖNTEMİ (Excel):
+
+  1. Excel'i BOŞ bir çalışma kitabıyla açın (dosyaya çift tıklamayın).
+  2. Üst menüden: Veri (Data) > Metinden/CSV'den (From Text/CSV)
+  3. İlgili telem_*.csv dosyasını seçin.
+  4. Önizleme penceresinde:
+       - Sınırlayıcı (Delimiter): "Noktalı virgül" (Semicolon) seçin.
+       - Köken dosya (Origin) / Kodlama: UTF-8
+  5. "Veri Dönüştür" (Transform Data) veya doğrudan "Yükle" (Load) yerine,
+     sayısal sütunların TİPİNİ kontrol edin:
+       - Power Query editöründe (Veri Dönüştür ile açılır) her sayısal
+         sütunun "Yerel Ayar Kullanarak Dönüştür" (Using Locale) seçeneğiyle
+         Ondalik ayracı NOKTA olan bir yerel ayar (örn. "İngilizce (ABD)")
+         kullanarak Ondalık Sayı'ya çevrildiğinden emin olun.
+  6. "Kapat ve Yükle" (Close & Load) ile çalışma sayfasına aktarın.
+
+NEDEN ONDALIK AYRACI NOKTA?
+
+Bu BİLİNÇLİ bir karardır: format_record() (csv_logger.py) her zaman "."
+kullanır, sistem/Excel bölgesel ayarından TAMAMEN BAĞIMSIZDIR (bkz.
+tests/test_csv_logger.py:
+test_format_record_decimal_separator_is_dot_locale_independent). Bu sayede
+dosya, hangi bilgisayarda/hangi Windows dil ayarıyla üretilmiş olursa
+olsun HER ZAMAN aynı biçimde kalır — jüri/teknik kontrol farklı bir
+bilgisayarda açtığında da veriler DEĞİŞMEZ.
+
+SÜTUNLAR:
+
+  zaman_ms;hiz_kmh;T_bat_C;V_bat_C;kalan_enerji_Wh
+
+  zaman_ms          : AKS'in kendi zaman damgası (milisaniye)
+  hiz_kmh           : Hız (km/h), ondalık NOKTA ile
+  T_bat_C           : Batarya sıcaklığı (°C)
+  V_bat_C           : Batarya gerilimi (V), ondalık NOKTA ile
+  kalan_enerji_Wh   : Kalan enerji (Wh), tam sayı
+
+Sıralama hakkında not: bu dosya GELİŞ SIRASIYLA yazılır (zaman_ms'e göre
+sıralı DEĞİLDİR — bkz. README.md "Seri port kopması / yeniden bağlanma").
+Zaman damgasına göre sıralı bir türev dosya + uyum raporu için:
+
+    python tools/rapor.py telem_YYYYMMDD_HHMMSS.csv

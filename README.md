@@ -39,6 +39,31 @@ uygulama başlangıçta sistemde görünen seri portları (pyserial
 `list_ports`) konsola listeler ve gerçek kayıt için `--port COMx`
 verilmesi gerektiğini hatırlatır.
 
+## Headless (GUI'siz) mod — madde 87
+
+tkinter veya matplotlib bir laptopta açılamazsa (sürücü sorunu, eksik Tk
+kurulumu vb.) kayıt YİNE DE tutulmalı — grafik arayüz kaybı, 9.2.g'nin
+kaydı GÖSTERMEME değil kaydı hiç TUTAMAMA riskine dönüşmemeli.
+
+```
+python monitor.py --no-gui
+```
+
+Bu modda tkinter/matplotlib **hiç import edilmez** (modül seviyesinde
+değil, yalnızca GUI seçildiğinde yüklenir — bkz. `monitor._load_gui_dependencies`).
+Konsola 5 saniyede bir özet basılır:
+
+```
+[headless] satır: 128 | son zaman_ms: 64231 | maks ardışık fark: 1.0 sn | durum: BAĞLI
+```
+
+`Ctrl+C` ile durdurulur; açık dosya flush edilip kapatılır. MON-02 yedek
+kayıt yolu (`BACKUP_OUTPUT_DIR`) bu modda da aynen çalışır.
+
+**Otomatik düşüş:** `--no-gui` verilmeden çalıştırılıp da tkinter/matplotlib
+yüklenemezse (import hatası), uygulama ÇIKMAZ — bunu net bir konsol
+uyarısıyla bildirip otomatik olarak headless moda düşer.
+
 ## SIMULATE modu
 
 `config.py` içinde `SERIAL_PORT = "SIMULATE"` iken uygulama gerçek bir
@@ -117,6 +142,72 @@ vb.) uygulama KAPANMAZ:
   AÇILMAZ; her replay tespiti ayrıca `logs/events_*.log` dosyasına
   zaman damgalı `REPLAY?` notu olarak düşülür (teşhis amaçlı, CSV
   şemasını etkilemez).
+
+## Yer istasyonu (bu bilgisayar) kesintileri — madde 66
+
+Yukarıdaki bölüm AKS/UKS tarafındaki (araç) kesintileri anlatır. Bunun
+DIŞINDA, bu izleme merkezinin çalıştığı bilgisayarın kendisiyle ilgili bir
+kesinti sınıfı daha vardır ve bu, AKS tarafından GÖRÜLEMEZ:
+
+- Uygulamanın (`python monitor.py`) yeniden başlatılması (çökme, kapatıp
+  açma, güncelleme).
+- Bilgisayarın uykuya/hazırda bekletmeye geçmesi.
+- USB portunun güç tasarrufuyla geçici olarak kesilmesi/sıfırlanması.
+
+Bu durumlarda AKS'in kendisi kesintiyi FARK ETMEZ — link'i "UP" sanmaya
+devam eder ve tamponlama (replay) TETİKLENMEZ, çünkü tamponlama AKS'in
+kendi RF linkindeki bir kesintiye karşı tasarlanmıştır, yer istasyonunun
+(bu bilgisayarın) kendisindeki bir kesintiye karşı değil. Sonuç: CSV
+dosyasında telafisi olmayan, hiçbir replay ile doldurulmayacak bir boşluk
+oluşur.
+
+**Bu, monitor.py tarafından ÇÖZÜLEMEZ** (kök neden AKS/UKS tarafındaki bir
+tasarım sınırıdır) — ama monitor.py bunu GÖRÜNÜR kılar:
+
+- Açılışta, `config.OUTPUT_DIR` içinde önceki bir oturumdan kalma bir
+  `telem_*.csv` dosyası varsa, uygulama bunu tespit eder ve son
+  `zaman_ms` değerini `logs/events_*.log` dosyasına yazar.
+- Yeni oturumun İLK satırı geldiğinde, önceki oturumun son `zaman_ms`'i ile
+  aradaki fark hesaplanır. Fark pozitifse (yani gerçekten bir AKS
+  yeniden-boot'u değil de yalnızca yer istasyonu kesintisiyse), ekranda
+  KALICI bir not ("⚠ YER İSTASYONU KESİNTİSİ: X sn veri kaybı") ve
+  `logs/events_*.log`'da bir kayıt olarak görünür.
+- Bu fark, durum çubuğundaki "Maks. ardışık zaman farkı" göstergesine
+  (madde 67/68) dahil edilir.
+
+**Operasyonel önlemler (yarış günü):**
+
+- Laptop'ta uyku/hazırda bekletme KAPALI olmalı (bkz.
+  `PROVA_KONTROL_LISTESI.md`).
+- USB bağlantı noktasının güç tasarrufu (Aygıt Yöneticisi → USB Kök
+  Hub → Güç Yönetimi → "Bilgisayarın bu aygıtı kapatmasına izin ver"
+  KAPALI) devre dışı bırakılmalı.
+- Uygulama yarışın ORTASINDA (zorunlu olmadıkça) yeniden BAŞLATILMAMALI —
+  her yeniden başlatma, yukarıdaki telafisiz boşluk riskini taşır.
+
+## Kayıt klasörü bir bulut senkron klasöründe olmamalı — madde 85
+
+`logs/` klasörü (veya `config.OUTPUT_DIR` neyi gösteriyorsa) OneDrive,
+Dropbox, Google Drive veya iCloud gibi bulut senkron klasörlerinden
+BİRİNİN İÇİNDEYSE, kayıt sırasında şu risklerle karşılaşılabilir:
+
+- Senkron istemcisi dosyayı okumak için geçici olarak KİLİTLEYEBİLİR.
+- Senkron gecikmesi diskteki yazma performansını etkileyebilir.
+- Aynı anda hem monitor.py hem de senkron istemcisi dosyaya erişmeye
+  çalışabilir.
+
+Uygulama açılışta yolu kontrol eder; eşleşme varsa ENGELLEMEZ, yalnızca net
+bir uyarı basar (konsol, GUI başlığı altında kalıcı bir satır, ve
+`logs/events_*.log`).
+
+**Yarış günü — OneDrive duraklatma adımları (Windows):**
+
+1. Görev çubuğundaki OneDrive bulut simgesine sağ tıklayın.
+2. "Yardım ve Ayarlar" (Help & Settings) → "Senkronizasyonu Duraklat"
+   (Pause syncing) → "2 saat" (veya yarış süresi kadar) seçin.
+3. Alternatif/kalıcı çözüm: `config.py` içindeki `OUTPUT_DIR` değerini
+   OneDrive'ın dışında bir klasöre (örn. `C:\TUFAN_KAYIT\logs`) çevirin.
+4. Yarış bitince senkronizasyonu tekrar başlatmayı unutmayın.
 
 ## Teknik kontrol provası (60 sn anten sök-tak senaryosu)
 

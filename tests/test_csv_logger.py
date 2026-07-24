@@ -4,6 +4,7 @@ from datetime import datetime
 
 import pytest
 
+import config
 import csv_logger
 from csv_logger import (
     HEADER,
@@ -14,6 +15,7 @@ from csv_logger import (
     make_events_log_filename,
     make_log_filename,
     parse_csv_line,
+    parse_csv_line_verbose,
 )
 
 
@@ -151,6 +153,24 @@ def test_make_log_filename_default_pattern_unchanged(tmp_path, monkeypatch):
     assert not os.path.basename(filename).endswith("_SIM.csv")
 
 
+# --- MON-12 (madde 84): config.OUTPUT_DIR gerçekten kullanılmalı -----------
+
+
+def test_make_log_filename_uses_configured_output_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config, "OUTPUT_DIR", "custom_kayit_klasoru")
+    filename = make_log_filename()
+    assert os.path.dirname(filename) == "custom_kayit_klasoru"
+    assert (tmp_path / "custom_kayit_klasoru").is_dir()
+
+
+def test_make_events_log_filename_uses_configured_output_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config, "OUTPUT_DIR", "custom_kayit_klasoru")
+    filename = make_events_log_filename()
+    assert os.path.dirname(filename) == "custom_kayit_klasoru"
+
+
 def test_make_log_filename_with_sim_suffix(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     filename = make_log_filename(suffix="_SIM")
@@ -262,6 +282,14 @@ def test_detect_new_boot_reset():
     assert detect_new_boot(500, 2) is True
 
 
+def test_detect_new_boot_equal_seq_is_not_a_new_boot():
+    # MON-13 (madde 109/1): eski "ikinci katman" (curr_seq < 10 and
+    # prev_seq > 100) matematiksel olarak ULAŞILAMAZ ölü kod olduğundan
+    # silindi -- tek koşul (curr_seq < prev_seq) davranışı DEĞİŞTİRMEDİ.
+    # curr_seq == prev_seq (tekrar/eşit) bir boot DEĞİLDİR.
+    assert detect_new_boot(100, 100) is False
+
+
 def _simulate_boot_count(seq_ts_pairs):
     """serial_worker'daki prev_seq izleme mantigini tekrarlar: her (seq, ts)
     ciftini sirayla detect_new_boot'a verir, kac kez yeni-boot tetiklendigini
@@ -324,3 +352,91 @@ def test_is_replay_ts_true_when_ts_goes_backward():
 def test_is_replay_ts_false_when_ts_advances_or_holds():
     assert is_replay_ts(100000, 100500) is False
     assert is_replay_ts(100000, 100000) is False
+
+
+# --- MON-03 (madde 50/69): alan bazlı aralık kapıları ------------------------
+
+
+def test_parse_csv_line_rejects_speed_above_max():
+    too_fast = f"CSV,0,{int((config.MAX_SPEED_KMH + 10) * 10)},32,780,6283,1"
+    assert parse_csv_line(too_fast) is None
+
+
+def test_parse_csv_line_rejects_negative_speed():
+    assert parse_csv_line("CSV,0,-10,32,780,6283,1") is None
+
+
+def test_parse_csv_line_accepts_speed_at_bounds():
+    low = f"CSV,0,{int(config.MIN_SPEED_KMH * 10)},32,780,6283,1"
+    high = f"CSV,0,{int(config.MAX_SPEED_KMH * 10)},32,780,6283,1"
+    assert parse_csv_line(low) is not None
+    assert parse_csv_line(high) is not None
+
+
+def test_parse_csv_line_rejects_temp_out_of_range():
+    too_cold = f"CSV,0,300,{config.MIN_TEMP_C - 1},780,6283,1"
+    too_hot = f"CSV,0,300,{config.MAX_TEMP_C + 1},780,6283,1"
+    assert parse_csv_line(too_cold) is None
+    assert parse_csv_line(too_hot) is None
+
+
+def test_parse_csv_line_accepts_temp_at_bounds():
+    low = f"CSV,0,300,{config.MIN_TEMP_C},780,6283,1"
+    high = f"CSV,0,300,{config.MAX_TEMP_C},780,6283,1"
+    assert parse_csv_line(low) is not None
+    assert parse_csv_line(high) is not None
+
+
+def test_parse_csv_line_rejects_voltage_above_max():
+    # şartname: batarya paketi 150 V'u aşamaz
+    too_high = f"CSV,0,300,32,{int((config.MAX_VOLTAGE_V + 1) * 10)},6283,1"
+    assert parse_csv_line(too_high) is None
+
+
+def test_parse_csv_line_accepts_voltage_at_max_bound():
+    at_max = f"CSV,0,300,32,{int(config.MAX_VOLTAGE_V * 10)},6283,1"
+    assert parse_csv_line(at_max) is not None
+
+
+def test_parse_csv_line_rejects_soc_out_of_range():
+    over_100 = f"CSV,0,300,32,780,{int((config.MAX_SOC_PERCENT + 1) * 100)},1"
+    negative = "CSV,0,300,32,780,-100,1"
+    assert parse_csv_line(over_100) is None
+    assert parse_csv_line(negative) is None
+
+
+def test_parse_csv_line_rejects_negative_timestamp():
+    assert parse_csv_line("CSV,-1,300,32,780,6283,1") is None
+
+
+def test_parse_csv_line_verbose_success_has_no_reason():
+    parsed, reason = parse_csv_line_verbose("CSV,12345,300,32,780,6283,42")
+    assert parsed is not None
+    assert reason is None
+
+
+def test_parse_csv_line_verbose_wrong_field_count_is_parse_hatasi():
+    parsed, reason = parse_csv_line_verbose("CSV,12345,300,32,780")
+    assert parsed is None
+    assert reason == "parse_hatasi"
+
+
+def test_parse_csv_line_verbose_non_numeric_field_is_parse_hatasi():
+    parsed, reason = parse_csv_line_verbose("CSV,abc,300,32,780,6283,42")
+    assert parsed is None
+    assert reason == "parse_hatasi"
+
+
+def test_parse_csv_line_verbose_out_of_range_field_is_aralik_hatasi():
+    too_fast = f"CSV,0,{int((config.MAX_SPEED_KMH + 10) * 10)},32,780,6283,1"
+    parsed, reason = parse_csv_line_verbose(too_fast)
+    assert parsed is None
+    assert reason == "aralik_hatasi"
+
+
+def test_parse_csv_line_verbose_non_csv_prefix_is_not_a_rejection():
+    # "CSV," ile başlamayan satır bir RED değildir -- çağıran taraf zaten
+    # bu fonksiyonu yalnız "CSV," öneki doğrulandıktan sonra çağırır.
+    parsed, reason = parse_csv_line_verbose("LINK,DOWN")
+    assert parsed is None
+    assert reason is None

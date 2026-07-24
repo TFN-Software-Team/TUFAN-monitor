@@ -1,375 +1,72 @@
-"""TUFAN İzleme Merkezi - ana uygulama (seri okuma + CSV yazma + GUI)."""
+"""TUFAN İzleme Merkezi - GUI (tkinter/matplotlib) uygulaması.
+
+MON-11 (madde 95): saf mantık + donanım/dosya G-Ç (seri okuma worker'i dahil)
+monitor_core.py'ye taşındı -- bu modül yalnızca GUI'ye (MetricCard,
+MonitorApp) ve CLI giriş noktasına (main) odaklanır. tkinter/matplotlib
+eksikse yalnızca BU modülün import'u başarısız olur; monitor_core.py'yi
+kullanan (worker/saf fonksiyon) testler bundan ETKİLENMEZ.
+
+MON-10 (madde 87): tkinter/matplotlib MODÜL SEVİYESİNDE import EDİLMEZ --
+yalnızca `run_gui()` çağrıldığında (bkz. `_load_gui_dependencies`) yüklenir.
+Böylece `python monitor.py --no-gui` bu iki bağımlılığı hiç yüklemeden
+`monitor_core.run_headless()`'a düşebilir; ayrıca `import monitor` (örn.
+`--port`/`--no-gui` argüman ayrıştırma testleri için) tkinter kurulu
+olmayan bir ortamda bile güvenle çalışır.
+"""
 
 import argparse
 import bisect
 import os
 import queue
+import sys
 import threading
 import time
-import tkinter as tk
-
-import serial
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
-from serial.tools import list_ports
 
 import config
-from csv_logger import (
-    HEADER,
-    detect_new_boot,
-    format_event_line,
-    format_record,
-    is_replay_ts,
-    make_events_log_filename,
-    make_log_filename,
-    parse_csv_line,
+from monitor_core import (
+    MAX_WORKER_RESTARTS,
+    WorkerHeartbeat,
+    build_line_with_gaps,
+    check_output_dir_writable,
+    compute_stale_display,
+    compute_worker_health_state,
+    detect_cloud_sync_folder,
+    format_port_list_message,
+    format_timestamp_ms,
+    insert_sorted_point,
+    list_available_ports,
+    list_ports,  # noqa: F401 -- testler monitor.list_ports.comports'u monkeypatch'ler (paylaşılan modül nesnesi)
+    max_consecutive_gap_sec,
+    run_headless,
+    serial_worker,
+    trim_history_window,
+    truncate_path_for_display,
 )
 
 LINK_TIMEOUT_SEC = 3.0
 GUI_POLL_MS = 200
-RECONNECT_INTERVAL_SEC = 2.0  # 9.2.h: port kopunca 2 sn'de bir yeniden bağlanma denenir
 
-# R2 (9.2.e/9.2.h): grafik çizgisi, henüz replay ile doldurulmamış >5 sn'lik
-# bir boşlukta KESİLİR (düz-çizgi ile "veri var" yanılsaması verilmez) —
-# _refresh_interval_indicator'daki aynı 5.0 sn eşiğiyle tutarlı.
-GRAPH_GAP_BREAK_SEC = 5.0
-
-
-def insert_sorted_point(history, point):
-    """(ts_sec, value) noktasini history'e ts_sec'e göre SIRALI ekler
-    (bisect.insort) — geliş sırası yerine zaman damgasına göre; böylece geç
-    gelen replay noktaları (eski ts_sec) grafik üzerinde doğru (geçmiş)
-    konuma yerleşir, sona değil. Saf fonksiyon — tkinter/matplotlib'e
-    dokunmaz, doğrudan test edilebilir."""
-    bisect.insort(history, point)
+# MON-10: modül seviyesinde import EDİLMEZ (bkz. _load_gui_dependencies) --
+# yalnızca isim çözümlemesi için yer tutucu; MetricCard/_Tooltip/MonitorApp
+# metodları bunlara yalnız ÇAĞRILDIKLARINDA erişir (tanım anında değil), bu
+# yüzden gerçek değerleri run_gui() çağrılana kadar None kalması güvenlidir.
+tk = None
+FigureCanvasTkAgg = None
+Figure = None
 
 
-def trim_history_window(history, window_sec):
-    """SIRALI (ts_sec, value) listesinden, en yeni ts_sec'ten window_sec'ten
-    daha eskiye düşen noktaları atar. Pencere en yeni BİLİNEN telemetri
-    zaman damgasına göredir (duvar-saati "şimdi"ye göre DEĞİL) — bir kesinti
-    sırasında telemetri ts'si ilerlemese de (offline örnekleme sürer ama
-    henüz replay edilmediyse grafik güncellenmez) pencere sabit kalır;
-    replay geldiğinde en yeni ts ilerler ve pencere onunla birlikte kayar."""
-    if not history:
-        return history
-    cutoff = history[-1][0] - window_sec
-    return [(t, v) for t, v in history if t >= cutoff]
-
-
-def build_line_with_gaps(history, gap_threshold_sec=GRAPH_GAP_BREAK_SEC):
-    """SIRALI (ts_sec, value) listesinden matplotlib çizgi verisi üretir;
-    ardışık iki nokta arasındaki ts farkı gap_threshold_sec'i aşarsa aralarına
-    bir (NaN, NaN) kırılma noktası eklenir — matplotlib bu noktada çizgiyi
-    ÇİZMEZ (boşluk görünür kalır). Replay paketleri geldikçe insert_sorted_point
-    ile araya yeni noktalar girer, sonraki çağrıda boşluk küçülür/dolar. Saf
-    fonksiyon — doğrudan test edilebilir."""
-    xs: list[float] = []
-    ys: list[float] = []
-    prev_ts = None
-    for ts_sec, value in history:
-        if prev_ts is not None and (ts_sec - prev_ts) > gap_threshold_sec:
-            xs.append(float("nan"))
-            ys.append(float("nan"))
-        xs.append(ts_sec)
-        ys.append(value)
-        prev_ts = ts_sec
-    return xs, ys
-
-
-def _simulate_suffix():
-    """SIMULATE modunda sahte veri dosyalarını gerçek kayıttan ayırmak için
-    dosya adı eki. Tek noktadan çözülür: open_log_file/open_events_log
-    çağıran her yer (ilk açılış ve yeni-boot sonrası yeniden açılış dahil)
-    bunu otomatik alır."""
-    return "_SIM" if config.SERIAL_PORT == "SIMULATE" else ""
-
-
-def open_log_file():
-    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    filename = make_log_filename(suffix=_simulate_suffix())
-    # "x" (exclusive create): make_log_filename zaten diskteki isim
-    # çakışmalarını sayaç ekiyle önler; bu sadece savunma katmanıdır --
-    # isim üretimi bir şekilde bozulup mevcut bir dosyayla çakışırsa "w"
-    # gibi sessizce sıfırlamak (truncate) yerine FileExistsError fırlatır.
-    f = open(filename, "x", encoding="utf-8")
-    f.write(HEADER + "\n")
-    f.flush()
-    return f, filename
-
-
-def open_events_log():
-    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    filename = make_events_log_filename(suffix=_simulate_suffix())
-    return open(filename, "a", encoding="utf-8")
-
-
-class MockSerial:
-    """SIMULATE modu için sahte AKS seri veri kaynağı.
-
-    R2 (9.2.e/9.2.h): periyodik olarak GERÇEKÇİ bir kesinti + replay
-    senaryosu üretir — LINK,DOWN -> OUTAGE_TICKS sn boyunca hiçbir satır
-    gelmez (b"" — gerçek RF kesintisinde olduğu gibi) -> LINK,UP -> geriye
-    dönük (backdated) ts'li bir replay burst'ü -> canlıya dönüş. Böylece
-    Monitor'un sıralı-ekleme + boşluk-kırma (gap-break) grafik davranışı
-    `python monitor.py` (SIMULATE modu, gerçek COM portu gerektirmez) ile
-    gözle görülür şekilde denenebilir (bkz. Documents/LoRa_Link_Analysis.md
-    "Bench Prosedürü").
-    """
-
-    OUTAGE_EVERY_N_TICKS = 40
-    OUTAGE_TICKS = 8  # ~8 sn'lik kesinti (LINK_TIMEOUT_MS'e yakın, kısa demo)
-
-    def __init__(self):
-        self.seq = 0
-        self.start_time = time.time()
-        self.speed = 50.0
-        self.soc = 90.0
-        self.temp = 35
-        self._tick = 0
-        self._mode = "live"  # "live" | "offline" | "draining"
-        self._offline_backlog = []  # (elapsed_ms, speed, temp, soc, seq)
-
-    def _advance_sensors(self):
-        import random
-        self.speed += random.uniform(-3, 3)
-        self.speed = max(0, min(config.MAX_SPEED_KMH - 20, self.speed))
-
-        self.temp += random.choice([-1, 0, 1])
-        self.temp = max(20, min(65, self.temp))
-
-        self.soc -= 0.05
-        self.soc = max(0, self.soc)
-
-    def _build_csv_line(self, elapsed_ms, speed, temp, soc, seq):
-        voltage = 45.0 + (soc / 100.0) * 8.0
-        speed_x10 = int(speed * 10)
-        voltage_deciv = int(voltage * 10)
-        soc_hundredths = int(soc * 100)
-        return f"CSV,{elapsed_ms},{speed_x10},{temp},{voltage_deciv},{soc_hundredths},{seq}\r\n".encode("utf-8")
-
-    def readline(self):
-        time.sleep(1.0)  # 1 saniye aralıklarla veri simüle et
-        self._tick += 1
-
-        if self._mode == "draining" and self._offline_backlog:
-            r_ms, r_speed, r_temp, r_soc, r_seq = self._offline_backlog.pop(0)
-            if not self._offline_backlog:
-                self._mode = "live"
-            return self._build_csv_line(r_ms, r_speed, r_temp, r_soc, r_seq)
-
-        elapsed_ms = int((time.time() - self.start_time) * 1000)
-        self._advance_sensors()
-
-        if self._mode == "live":
-            if self._tick % self.OUTAGE_EVERY_N_TICKS == 0:
-                self._mode = "offline"
-                self._offline_backlog = []
-                return b"LINK,DOWN\r\n"
-            self.seq += 1
-            return self._build_csv_line(elapsed_ms, self.speed, self.temp, self.soc, self.seq)
-
-        # self._mode == "offline": RF fiilen kesik — canlı TX YOK (readline
-        # boş döner, gerçek bir kablo/menzil kopmasında olduğu gibi), ama
-        # AKS yerel olarak (offline buffer) örneklemeye devam eder.
-        self.seq += 1
-        self._offline_backlog.append((elapsed_ms, self.speed, self.temp, self.soc, self.seq))
-        if len(self._offline_backlog) >= self.OUTAGE_TICKS:
-            self._mode = "draining"
-            return b"LINK,UP\r\n"
-        return b""
-
-    def close(self):
-        pass
-
-
-def open_serial_connection():
-    if config.SERIAL_PORT == "SIMULATE":
-        return MockSerial()
-    return serial.Serial(config.SERIAL_PORT, config.SERIAL_BAUD, timeout=2)
-
-
-def serial_worker(data_queue, stop_event, connect=open_serial_connection,
-                   reconnect_interval=RECONNECT_INTERVAL_SEC):
-    """Seri portu okur, CSV'ye yazar ve ayrıştırılmış verileri kuyruğa koyar.
-
-    Bu fonksiyon ayrı bir thread'de çalışır; CSV dosyaya yazma işlemi
-    burada kalır, GUI sadece data_queue üzerinden veri okur.
-
-    9.2.g: port koparsa (USB çekilmesi vb.) uygulama ÇIKMAZ — açık log dosyası
-    öyle kalır, `reconnect_interval` saniyede bir yeniden bağlanma denenir.
-    Yeniden bağlanma AYNI dosyada devam eder; yeni dosyaya geçiş yalnızca
-    `detect_new_boot` seq üzerinden gerçek bir yeni boot tespit ettiğinde olur
-    (bkz. csv_logger.detect_new_boot) — bağlantı kopması tek başına yeni dosya
-    açtırmaz.
-    """
-    log_file, filename = open_log_file()
-    data_queue.put({"type": "filename", "name": filename})
-    events_file = open_events_log()
-
-    def log_event(message):
-        events_file.write(format_event_line(message) + "\n")
-        events_file.flush()
-
-    print("TUFAN İzleme Merkezi başlatıldı")
-    if not config.CONFIG_CONFIRMED:
-        print(
-            "UYARI: BATARYA KAPASITESI TEYITSIZ — kalan_enerji_Wh kolonu "
-            "gecersiz (config.py: CONFIG_CONFIRMED=False)"
-        )
-    if config.SERIAL_PORT == "SIMULATE":
-        print(
-            "UYARI: SIMULATE modu aktif — uretilen tum veri SAHTEDIR, "
-            "gercek kayit icin config.py SERIAL_PORT'u gercek COM portuna cevirin "
-            "veya --port COMx ile calistirin"
-        )
-
-    prev_seq = None
-    prev_ts_ms = None
-    ser = None
-
-    try:
-        while not stop_event.is_set():
-            if ser is None:
-                try:
-                    ser = connect()
-                except serial.SerialException:
-                    ser = None
-
-                if ser is None:
-                    data_queue.put({"type": "port_down", "ts": time.monotonic()})
-                    log_event(
-                        f"SERI PORT KOPUK: {config.SERIAL_PORT} acilamadi, "
-                        f"{reconnect_interval:.0f} sn sonra tekrar denenecek"
-                    )
-                    if stop_event.wait(reconnect_interval):
-                        break
-                    continue
-
-                data_queue.put({"type": "port_up", "ts": time.monotonic()})
-                log_event(f"SERI PORT BAGLANDI: {config.SERIAL_PORT} | Dosya: {filename}")
-                print(f"Port: {config.SERIAL_PORT} | Dosya: {filename}")
-
-            try:
-                raw = ser.readline()
-            except (serial.SerialException, OSError) as exc:
-                log_event(f"SERI PORT KOPTU: {exc}")
-                data_queue.put({"type": "port_down", "ts": time.monotonic()})
-                try:
-                    ser.close()
-                except Exception:
-                    pass
-                ser = None
-                continue
-
-            if not raw:
-                continue
-
-            # errors="ignore" hicbir zaman UnicodeDecodeError firlatmaz,
-            # bu yuzden try/except gerekmez.
-            line = raw.decode("utf-8", errors="ignore").strip()
-
-            if not line:
-                continue
-
-            if line.startswith("CSV,"):
-                parsed = parse_csv_line(line)
-                if parsed is None:
-                    continue
-
-                curr_seq = parsed["seq"]
-                curr_ts_ms = parsed["timestamp_ms"]
-                if detect_new_boot(prev_seq, curr_seq):
-                    log_file.flush()
-                    log_file.close()
-                    log_file, filename = open_log_file()
-                    data_queue.put({"type": "filename", "name": filename})
-                    # R2: yeni boot -> ts_ms sıfırdan başlar; GUI grafiği
-                    # (ts_ms tabanlı x ekseni) eski boot'un yüksek ts'leriyle
-                    # karışmasın diye temizlenmeli.
-                    data_queue.put({"type": "new_boot"})
-                    log_event(f"YENI BOOT tespit edildi -> {filename}")
-                    print(f"YENİ BOOT tespit edildi → {filename}")
-                elif is_replay_ts(prev_ts_ms, curr_ts_ms):
-                    # 9.2.e: AKS offline-buffer drenajı sırasında replay edilen
-                    # paketler eski ts taşır ama seq artmaya devam eder (bkz.
-                    # csv_logger.detect_new_boot) — CSV satırı normal şekilde
-                    # yazılır, bu yalnızca teşhis/jüri için events log notudur.
-                    log_event(
-                        f"REPLAY? ts_ms geriye gitti: {prev_ts_ms} -> {curr_ts_ms} "
-                        f"(seq {prev_seq} -> {curr_seq})"
-                    )
-
-                prev_seq = curr_seq
-                prev_ts_ms = curr_ts_ms
-
-                # R2 KARAR: CSV satırları GELİŞ SIRASIYLA yazılmaya devam
-                # eder (replay ts'si eski olsa bile dosyada sonra görünür) —
-                # şartname (9.2.e/9.2.h) satırların dosyada ts_ms'e göre
-                # SIRALI olmasını ŞART KOŞMUYOR, yalnızca kesinti aralığının
-                # ts damgalarıyla (herhangi bir sırada) MEVCUT olmasını
-                # istiyor. Sıra bilgisi zaten zaman damgasının (ts_ms, ilk
-                # kolon) kendisinde var — jüri/analiz sort ederek okuyabilir.
-                # Grafik (GUI) ise ts_sec'e göre sıralı ekler (bkz.
-                # insert_sorted_point) çünkü ORADA çizgi süreklidiği için
-                # geliş sırası YETERSİZ kalır; CSV dosyası için bu gerekçe
-                # geçerli değil.
-                record = format_record(parsed, config.BATTERY_CAPACITY_WH)
-                log_file.write(record + "\n")
-                # 9.2.g: kayıt kanıt niteliğindedir — çökme anında veri
-                # kaybı kabul edilemez, bu yüzden her satırda hemen
-                # flush + fsync (OS sayfa önbelleğini de aşıp diske yazar).
-                log_file.flush()
-                os.fsync(log_file.fileno())
-
-                data_queue.put(
-                    {
-                        "type": "csv",
-                        "ts": time.monotonic(),
-                        # R2: paketin KENDİ zaman damgası (AKS ts_ms, sn) —
-                        # grafik x ekseni artık VARIŞ sırası/zamanı yerine bunu
-                        # kullanır (geç gelen replay noktaları doğru yere
-                        # yerleşsin diye). "ts" (yukarıda, wall-clock varış)
-                        # yalnız bağlantı sağlık göstergeleri için kalır.
-                        "ts_sec": curr_ts_ms / 1000.0,
-                        "speed_kmh": parsed["speed_kmh_x10"] / 10,
-                        "temp_c": parsed["temp_c"],
-                        "voltage_v": parsed["pack_voltage_deciv"] / 10,
-                        "soc_percent": parsed["soc_hundredths"] / 100,
-                        "energy_wh": round(
-                            parsed["soc_hundredths"] / 10000 * config.BATTERY_CAPACITY_WH
-                        ),
-                    }
-                )
-
-            elif line.startswith("LINK,DOWN"):
-                # 9.2.f şeması 5 kolonludur — LINK satırları CSV'ye YAZILMAZ,
-                # yalnızca GUI'ye ve events log'a bildirilir.
-                data_queue.put({"type": "link_down", "ts": time.monotonic()})
-                log_event("LINK,DOWN alindi")
-
-            elif line.startswith("LINK,UP"):
-                data_queue.put({"type": "link_up", "ts": time.monotonic()})
-                log_event("LINK,UP alindi")
-
-            else:
-                continue
-
-    except Exception as exc:
-        log_event(f"Beklenmeyen hata: {exc}")
-        print(f"Seri okuma hatası: {exc}")
-    finally:
-        log_file.flush()
-        log_file.close()
-        if ser is not None:
-            try:
-                ser.close()
-            except Exception:
-                pass
-        log_event("Izleme durduruldu")
-        events_file.flush()
-        events_file.close()
-        print(f"İzleme durduruldu. Dosya kaydedildi: {filename}")
+def _load_gui_dependencies():
+    """MON-10 (madde 87): tkinter/matplotlib'i LAZY olarak yükler -- yalnız
+    GUI modu gerçekten seçildiğinde (bkz. run_gui) çağrılır. Biri eksikse
+    ImportError fırlatır; çağıran taraf (main) bunu yakalayıp headless moda
+    otomatik düşebilir."""
+    global tk, FigureCanvasTkAgg, Figure
+    import tkinter as _tk
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg as _FigureCanvasTkAgg
+    from matplotlib.figure import Figure as _Figure
+    tk = _tk
+    FigureCanvasTkAgg = _FigureCanvasTkAgg
+    Figure = _Figure
 
 
 class MetricCard:
@@ -420,8 +117,48 @@ class MetricCard:
         self.bar = self.canvas.create_rectangle(0, 0, 0, 4, fill=color, width=0)
         self.canvas.bind("<Configure>", self._on_resize)
 
+        # MON-04/05: opsiyonel küçük alt yazı -- ZAMAN kartında ham zaman_ms
+        # değeri, MON-05'te "son veri: X sn önce" için kullanılır.
+        self.subtitle_label = tk.Label(
+            self.center_container, text="", font=("Helvetica Neue", 8),
+            fg="#475569", bg="#161D30",
+        )
+        self.subtitle_label.pack(fill="x", side="top", anchor="w", pady=(2, 0))
+        self._stale = False
+
     def _on_resize(self, event=None):
         self.update_bar()
+
+    def set_subtitle(self, text):
+        self.subtitle_label.config(text=text)
+
+    def set_display(self, value_text, subtitle=""):
+        """MON-04: serbest biçimli (float'a zorlanmayan) bir değer göster --
+        örneğin ZAMAN kartının "dk:sn.ms" biçimi. Bar güncellenmez (bu kart
+        için bir ilerleme çubuğu anlamlı değil)."""
+        self.value_label.config(text=value_text, fg=self.color)
+        self.subtitle_label.config(text=subtitle, fg="#475569")
+        self._stale = False
+
+    def set_stale(self, is_stale, message=""):
+        """MON-05 (madde 49): bayat veri -- kartı "--" gösterip gri/soluk
+        yapar. Veri geri geldiğinde (is_stale=False) normal renge döner;
+        set_value/set_display bir sonraki çağrıda zaten kendi rengini
+        uygular, burada yalnız staleness geçişini yönetiyoruz."""
+        self._stale = is_stale
+        if is_stale:
+            self.value_label.config(text="--", fg="#475569")
+            self.canvas.itemconfig(self.bar, fill="#334155")
+            self.subtitle_label.config(text=message, fg="#F59E0B")
+        else:
+            # NOT: subtitle_label bilerek DOKUNULMAZ -- fresh veri geldiğinde
+            # (bu geçiş zaten yalnız bu durumda tetiklenir) set_value/
+            # set_display çağrısı AYNI GUI turunda, bu satırdan ÖNCE zaten
+            # doğru subtitle'ı yazmış olur (bkz. MonitorApp.update_gui sırası:
+            # önce mesaj kuyruğu işlenir, sonra _refresh_stale_state çağrılır).
+            # Burada temizlemek, o taze subtitle'ı ANINDA silerdi.
+            self.value_label.config(fg=self.color)
+            self.canvas.itemconfig(self.bar, fill=self.color)
 
     def set_value(self, value):
         try:
@@ -435,6 +172,9 @@ class MetricCard:
             val_str = f"{value}"
 
         self.value_label.config(text=val_str)
+        # Taze bir sayısal değer geldi -- olası bir önceki "son veri: X sn
+        # önce" (staleness) alt yazısını temizle.
+        self.subtitle_label.config(text="", fg="#475569")
 
         # Dynamic temperature coloring
         if self.title == "SICAKLIK":
@@ -462,11 +202,101 @@ class MetricCard:
             self.canvas.coords(self.bar, 0, 0, int(width * pct), 4)
 
 
+class _Tooltip:
+    """MON-08 (madde 108): basit hover tooltip -- yalnızca kısaltılmış bir
+    yolun tam halini göstermek için, ekstra bağımlılık gerektirmeden saf
+    tkinter ile."""
+
+    def __init__(self, widget, text_provider):
+        self.widget = widget
+        self.text_provider = text_provider
+        self.tip_window = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+
+    def _show(self, event=None):
+        text = self.text_provider()
+        if not text or self.tip_window is not None:
+            return
+        x = self.widget.winfo_rootx() + 10
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip_window = tk.Toplevel(self.widget)
+        self.tip_window.wm_overrideredirect(True)
+        self.tip_window.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            self.tip_window, text=text, bg="#1E293B", fg="#F8FAFC",
+            font=("Helvetica Neue", 8), padx=6, pady=3,
+            highlightthickness=1, highlightbackground="#334155",
+        )
+        label.pack()
+
+    def _hide(self, event=None):
+        if self.tip_window is not None:
+            self.tip_window.destroy()
+            self.tip_window = None
+
+
 class MonitorApp:
     """tkinter tabanlı TUFAN telemetri izleme penceresi."""
 
     def __init__(self, root):
         self.root = root
+        self._current_title = None
+        self.recording_stopped = False
+        self._set_title()
+        self.root.geometry("1080x620")
+        self.root.minsize(1000, 540)
+        self.root.configure(bg="#0B0F19")
+
+        self.data_queue = queue.Queue()
+        self.stop_event = threading.Event()
+
+        self.packet_count = 0
+        self.parse_error_count = 0
+        self.range_error_count = 0
+        self.dedup_count = 0  # MON-13 (madde 109/3)
+        self.last_packet_time = None
+        self.start_time = time.monotonic()
+        # R2: [(ts_sec, hiz_kmh), ...] — ts_sec paketin KENDİ zaman damgası
+        # (AKS ts_ms/1000), varış sırası/zamanı DEĞİL; insert_sorted_point
+        # ile her zaman ts_sec'e göre SIRALI tutulur (bkz. update_gui).
+        self.speed_history = []
+
+        self.port_connected = True  # ilk bağlanma denemesi sonucu ilk mesajla güncellenir
+        self.link_connected = False
+
+        # MON-09 (madde 86): gerçekte bağlanılan port (otomatik keşifle
+        # config.SERIAL_PORT'tan farklı olabilir) ve son bilinen port listesi.
+        self.active_port = config.SERIAL_PORT
+        self.last_known_ports = []
+
+        # MON-01 (madde 19): worker canlılığı heartbeat + restart durumu.
+        self.heartbeat = WorkerHeartbeat()
+        self.worker_restart_count = 0
+        self.worker_permanently_failed = False
+        self._kayit_durdu_visible = False
+        self._blink_on = False
+        self._blink_tick = 0
+
+        # MON-05 (madde 49): veri hiç gelmemişken de "bayat" sayılır --
+        # kartlar başlangıçta zaten "--" gösterdiğinden bu tutarlıdır.
+        self._data_is_stale = True
+
+        # MON-06 (madde 67/68, 9.2.h): tüm zaman_ms değerleri SIRALI tutulur
+        # (yeni boot'ta temizlenir) -- gerçek ardışık boşluk hesaplanır.
+        self.all_timestamps_ms = []
+
+        # MON-08 (madde 108): durum çubuğu için tam dosya yolu ve satır sayısı.
+        self.log_file_path = None
+
+        self._build_widgets()
+
+        self._start_worker_thread()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.after(GUI_POLL_MS, self.update_gui)
+
+    def _set_title(self):
         title = "TUFAN Telemetri İzleme Merkezi"
         if not config.CONFIG_CONFIRMED:
             # 9.2.g: eksik parametre kaydı durduramaz — kayıt akışı devam
@@ -478,34 +308,23 @@ class MonitorApp:
             # uyarisiyla ayni kalicilikta baslikta gorunur kalmali (ikisi
             # ayni anda gecerliyse ikisi de eklenir).
             title += " [SİMÜLASYON — GERÇEK VERİ DEĞİL]"
-        self.root.title(title)
-        self.root.geometry("1020x600")
-        self.root.minsize(960, 520)
-        self.root.configure(bg="#0B0F19")
+        if self.recording_stopped:
+            # MON-01 (madde 19): pencere başlığına KALICI/görünür bir uyarı --
+            # ekran görüntüsü tek başına bile "kayıt durdu" kanıtı taşısın.
+            title += " [KAYIT DURDU]"
+        if title != self._current_title:
+            self._current_title = title
+            self.root.title(title)
 
-        self.data_queue = queue.Queue()
-        self.stop_event = threading.Event()
-
-        self.packet_count = 0
-        self.last_packet_time = None
-        self.start_time = time.monotonic()
-        # R2: [(ts_sec, hiz_kmh), ...] — ts_sec paketin KENDİ zaman damgası
-        # (AKS ts_ms/1000), varış sırası/zamanı DEĞİL; insert_sorted_point
-        # ile her zaman ts_sec'e göre SIRALI tutulur (bkz. update_gui).
-        self.speed_history = []
-
-        self.port_connected = True  # ilk bağlanma denemesi sonucu ilk mesajla güncellenir
-        self.link_connected = False
-
-        self._build_widgets()
-
+    def _start_worker_thread(self, restart_attempt=0):
+        self.heartbeat.beat()
         self.worker_thread = threading.Thread(
-            target=serial_worker, args=(self.data_queue, self.stop_event), daemon=True
+            target=serial_worker,
+            args=(self.data_queue, self.stop_event),
+            kwargs={"heartbeat": self.heartbeat, "restart_attempt": restart_attempt},
+            daemon=True,
         )
         self.worker_thread.start()
-
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.after(GUI_POLL_MS, self.update_gui)
 
     def _build_widgets(self):
         # Header panel
@@ -525,14 +344,65 @@ class MonitorApp:
         title_label.pack(anchor="w")
         
         self.file_label = tk.Label(
-            title_container, 
-            text="● BEKLEMEDE: Kayıt dosyası oluşturuluyor...", 
-            font=("Helvetica Neue", 9, "bold"), 
-            fg="#475569", 
+            title_container,
+            text="● BEKLEMEDE: Kayıt dosyası oluşturuluyor...",
+            font=("Helvetica Neue", 9, "bold"),
+            fg="#475569",
             bg="#0B0F19"
         )
         self.file_label.pack(anchor="w", pady=(2, 0))
-        
+
+        # MON-02 (madde 20): birincil kaydın hemen altında ikincil (yedek)
+        # kaydın durumunu gösteren küçük ikinci gösterge.
+        if config.BACKUP_OUTPUT_DIR:
+            backup_initial_text = "○ YEDEK KAYIT: bekleniyor..."
+        else:
+            backup_initial_text = "○ Yedek kayıt yolu ayarlanmadı"
+        self.backup_label = tk.Label(
+            title_container,
+            text=backup_initial_text,
+            font=("Helvetica Neue", 9, "bold"),
+            fg="#475569",
+            bg="#0B0F19"
+        )
+        self.backup_label.pack(anchor="w", pady=(2, 0))
+
+        # MON-01 (madde 19): "KOPUK" rozetinden GÖRSEL OLARAK FARKLI, büyük
+        # ve yanıp sönen bir uyarı -- yalnız worker gerçekten ölmüşken veya
+        # heartbeat 5 sn'den uzun süredir gelmemişken PACK edilir (bkz.
+        # _refresh_worker_health). Başlangıçta paketlenmez (görünmez).
+        self.kayit_durdu_label = tk.Label(
+            title_container,
+            text="⛔ KAYIT DURDU",
+            font=("Helvetica Neue", 14, "bold"),
+            fg="white",
+            bg="#EF4444",
+            padx=10,
+            pady=4,
+        )
+
+        # MON-16 (madde 66): yer istasyonu kesintisi tespit edilirse (ve
+        # yalnızca o zaman) dolan, oturum boyunca KALICI kalan bir not.
+        self.station_gap_label = tk.Label(
+            title_container,
+            text="",
+            font=("Helvetica Neue", 9, "bold"),
+            fg="#F59E0B",
+            bg="#0B0F19",
+        )
+        self.station_gap_label.pack(anchor="w", pady=(2, 0))
+
+        # MON-14 (madde 85): kayıt klasörü bir bulut senkron klasöründeyse
+        # (ve yalnızca o zaman) dolan, oturum boyunca KALICI kalan bir uyarı.
+        self.cloud_sync_label = tk.Label(
+            title_container,
+            text="",
+            font=("Helvetica Neue", 9, "bold"),
+            fg="#F59E0B",
+            bg="#0B0F19",
+        )
+        self.cloud_sync_label.pack(anchor="w", pady=(2, 0))
+
         team_label = tk.Label(
             header_frame, 
             text="TFN SOFTWARE TEAM", 
@@ -585,35 +455,52 @@ class MonitorApp:
         self.canvas.get_tk_widget().config(bg="#161D30", highlightthickness=0, takefocus=0)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        # RIGHT PANEL (Metric Cards Column - 40% Width)
-        right_panel = tk.Frame(main_container, bg="#0B0F19", width=300)
+        # RIGHT PANEL (Metric Cards Grid - 2 sütun x 3 satır)
+        right_panel = tk.Frame(main_container, bg="#0B0F19", width=340)
         right_panel.pack(side="right", fill="both", padx=(10, 0))
         right_panel.pack_propagate(False) # Stable layout
 
-        # Define 1 column and 5 rows
-        for r in range(5):
+        for r in range(3):
             right_panel.rowconfigure(r, weight=1)
         right_panel.columnconfigure(0, weight=1)
+        right_panel.columnconfigure(1, weight=1)
 
-        # Create cards inside the column
-        self.speed_card = MetricCard(right_panel, "HIZ", "km/h", 0, config.MAX_SPEED_KMH, "#00D2FF")
+        # MON-07 (madde 89): gösterge (bar) ölçekleri config.py'den -- kodda
+        # sabit bırakılmaz; gerçek paket aralığına göre.
+        self.speed_card = MetricCard(right_panel, "HIZ", "km/h", config.SPEED_GAUGE_MIN, config.MAX_SPEED_KMH, "#00D2FF")
         self.speed_card.frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
 
-        self.soc_card = MetricCard(right_panel, "SoC", "%", 0, 100, "#10B981")
+        # MON-04 (madde 48): ZAMAN kartı, hız kartının YANINDA.
+        self.time_card = MetricCard(right_panel, "ZAMAN", "", 0, 1, "#FACC15")
+        self.time_card.frame.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
+
+        self.soc_card = MetricCard(right_panel, "SoC", "%", config.SOC_GAUGE_MIN, config.SOC_GAUGE_MAX, "#10B981")
         self.soc_card.frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
 
-        self.voltage_card = MetricCard(right_panel, "GERİLİM", "V", 40.0, 60.0, "#A855F7")
-        self.voltage_card.frame.grid(row=2, column=0, sticky="nsew", padx=4, pady=4)
+        self.voltage_card = MetricCard(
+            right_panel, "GERİLİM", "V", config.VOLTAGE_GAUGE_MIN, config.VOLTAGE_GAUGE_MAX, "#A855F7"
+        )
+        self.voltage_card.frame.grid(row=1, column=1, sticky="nsew", padx=4, pady=4)
 
-        self.energy_card = MetricCard(right_panel, "KALAN ENERJİ", "Wh", 0, config.BATTERY_CAPACITY_WH, "#0EA5E9")
-        self.energy_card.frame.grid(row=3, column=0, sticky="nsew", padx=4, pady=4)
+        self.energy_card = MetricCard(
+            right_panel, "KALAN ENERJİ", "Wh", config.ENERGY_GAUGE_MIN, config.BATTERY_CAPACITY_WH, "#0EA5E9"
+        )
+        self.energy_card.frame.grid(row=2, column=0, sticky="nsew", padx=4, pady=4)
 
-        self.temp_card = MetricCard(right_panel, "SICAKLIK", "°C", 20, 80, "#F97316")
-        self.temp_card.frame.grid(row=4, column=0, sticky="nsew", padx=4, pady=4)
+        self.temp_card = MetricCard(
+            right_panel, "SICAKLIK", "°C", config.TEMP_GAUGE_MIN, config.TEMP_GAUGE_MAX, "#F97316"
+        )
+        self.temp_card.frame.grid(row=2, column=1, sticky="nsew", padx=4, pady=4)
+
+        # MON-05: bayat-veri kontrolünün döneceği kartların listesi.
+        self._metric_cards = [
+            self.speed_card, self.time_card, self.soc_card,
+            self.voltage_card, self.energy_card, self.temp_card,
+        ]
 
         # Status frame (Footer)
         status_frame = tk.Frame(self.root, bg="#0B0F19")
-        status_frame.pack(fill="x", padx=15, pady=(0, 10))
+        status_frame.pack(fill="x", padx=15, pady=(0, 5))
 
         self.status_badge = tk.Label(
             status_frame,
@@ -628,6 +515,14 @@ class MonitorApp:
             highlightthickness=0
         )
         self.status_badge.pack(side="left")
+
+        # MON-09 (madde 86): SERİ PORT KOPUK durumunda bulunan portları
+        # gösteren büyük/net uyarı -- yalnız port yokken dolu, aksi halde boş.
+        self.port_hint_label = tk.Label(
+            status_frame, text="", font=("Helvetica Neue", 10, "bold"),
+            fg="#EF4444", bg="#0B0F19",
+        )
+        self.port_hint_label.pack(side="left", padx=(10, 0))
 
         self.packet_label = tk.Label(status_frame, text="Alınan paket: 0", font=("Helvetica Neue", 9), fg="#64748B", bg="#0B0F19")
         self.packet_label.pack(side="left", padx=15)
@@ -646,13 +541,105 @@ class MonitorApp:
         )
         self.interval_label.pack(side="left", padx=15)
 
+        # MON-03 (madde 50/69): üç sayaç -- satır_kabul (packet_count'la
+        # paylaşılır), satır_parse_hatası, satır_aralık_hatası.
+        self.counters_label = tk.Label(
+            status_frame,
+            text="Kabul: 0 | Format hatası: 0 | Aralık hatası: 0",
+            font=("Helvetica Neue", 9),
+            fg="#64748B",
+            bg="#0B0F19",
+        )
+        self.counters_label.pack(side="left", padx=15)
+
+        # MON-06 (madde 67/68, 9.2.h): gerçek (varış değil, zaman damgası
+        # bazlı) ardışık boşluk göstergesi -- < 5 sn yeşil, >= 5 sn KIRMIZI.
+        self.max_gap_label = tk.Label(
+            status_frame,
+            text="Maks. ardışık zaman farkı: -- sn",
+            font=("Helvetica Neue", 9, "bold"),
+            fg="#94A3B8",
+            bg="#161D30",
+            padx=8,
+            pady=3,
+            highlightthickness=1,
+            highlightbackground="#242F4D",
+        )
+        self.max_gap_label.pack(side="left", padx=15)
+
+        # MON-08 (madde 108): kalıcı alt durum çubuğu -- port/baud/tam yol/
+        # satır sayısı, teknik kontrolde "kayıt nereye yazılıyor?" sorusuna
+        # ekrandan cevap verilebilsin.
+        bottom_bar = tk.Frame(self.root, bg="#0B0F19", highlightthickness=1, highlightbackground="#242F4D")
+        bottom_bar.pack(fill="x", padx=15, pady=(0, 10))
+
+        self.connection_summary_label = tk.Label(
+            bottom_bar,
+            text=f"{config.SERIAL_PORT} @ {config.SERIAL_BAUD}",
+            font=("Helvetica Neue", 9),
+            fg="#94A3B8",
+            bg="#0B0F19",
+        )
+        self.connection_summary_label.pack(side="left", padx=(6, 15), pady=4)
+
+        self.path_label = tk.Label(
+            bottom_bar, text="Dosya: --", font=("Helvetica Neue", 9), fg="#94A3B8", bg="#0B0F19",
+        )
+        self.path_label.pack(side="left", padx=(0, 10), pady=4)
+        self._path_tooltip = _Tooltip(self.path_label, lambda: self.log_file_path or "")
+
+        self.open_folder_button = tk.Button(
+            bottom_bar,
+            text="Klasörü Aç",
+            font=("Helvetica Neue", 8),
+            command=self._open_log_folder,
+            bg="#1E293B",
+            fg="#F8FAFC",
+            activebackground="#334155",
+            activeforeground="#F8FAFC",
+            relief="flat",
+            padx=8,
+            pady=2,
+        )
+        self.open_folder_button.pack(side="left", padx=(0, 15), pady=4)
+
+        self.row_count_label = tk.Label(
+            bottom_bar, text="0 satır", font=("Helvetica Neue", 9), fg="#94A3B8", bg="#0B0F19",
+        )
+        self.row_count_label.pack(side="left", padx=(0, 6), pady=4)
+
+    def _open_log_folder(self):
+        """MON-08 (madde 108): kayıt dosyasının bulunduğu klasörü Windows
+        Gezgini'nde açar. Dosya henüz bilinmiyorsa (worker daha başlamadı)
+        veya platform desteklenmiyorsa sessizce hiçbir şey yapmaz."""
+        if not self.log_file_path:
+            return
+        folder = os.path.dirname(os.path.abspath(self.log_file_path))
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder)
+            else:
+                print(f"Klasörü Aç yalnızca Windows'ta desteklenir: {folder}")
+        except Exception as exc:
+            print(f"Klasör açılamadı: {exc}")
+
     def _refresh_status_badge(self):
         if not self.port_connected:
             self.status_badge.config(text="SERİ PORT KOPUK", bg="#64748B", fg="white")
+            # MON-09 (madde 86): BÜYÜK ve net bir uyarı -- bulunan (varsa)
+            # portları göster, teknik kontrolde ekip nedenini anlayabilsin.
+            if self.last_known_ports:
+                self.port_hint_label.config(
+                    text="SERİ PORT BULUNAMADI — Bulunan portlar: " + ", ".join(self.last_known_ports)
+                )
+            else:
+                self.port_hint_label.config(text="SERİ PORT BULUNAMADI — Sistemde hiç seri port yok")
         elif not self.link_connected:
             self.status_badge.config(text="KOPUK", bg="#EF4444", fg="white")
+            self.port_hint_label.config(text="")
         else:
             self.status_badge.config(text="BAĞLI", bg="#10B981", fg="white")
+            self.port_hint_label.config(text="")
 
     def update_gui(self):
         now = time.monotonic()
@@ -676,6 +663,14 @@ class MonitorApp:
                 self.energy_card.set_value(msg['energy_wh'])
                 self.packet_label.config(text=f"Alınan paket: {self.packet_count}")
 
+                # MON-04 (madde 48): ham zaman_ms + insan-okunur "dk:sn.ms".
+                raw_ms = msg["timestamp_ms"]
+                self.time_card.set_display(format_timestamp_ms(raw_ms), subtitle=f"ham: {raw_ms} ms")
+
+                # MON-06 (madde 67/68, 9.2.h): SIRALI tüm zaman_ms listesi --
+                # gerçek ardışık boşluk bu tam listeden hesaplanır.
+                bisect.insort(self.all_timestamps_ms, raw_ms)
+
                 # R2: geliş sırası yerine paketin KENDİ ts_sec'ine göre sıralı
                 # ekle — geç gelen replay noktaları (eski ts_sec) grafikte
                 # doğru (geçmiş) konuma yerleşsin, listenin sonuna değil.
@@ -692,28 +687,183 @@ class MonitorApp:
             elif msg_type == "port_down":
                 self.port_connected = False
                 self.link_connected = False
+                # MON-09: hiçbir port açılamadıysa, bulunan (varsa) portları
+                # sakla -- durum çubuğunda/rozette gösterilecek.
+                self.last_known_ports = msg.get("available_ports", [])
 
             elif msg_type == "port_up":
                 self.port_connected = True
+                self.active_port = msg.get("port", config.SERIAL_PORT)
+                self.connection_summary_label.config(text=f"{self.active_port} @ {config.SERIAL_BAUD}")
 
             elif msg_type == "filename":
-                self.file_label.config(text=f"● KAYIT AKTİF: logs/{os.path.basename(msg['name'])}", fg="#10B981")
+                self.file_label.config(
+                    text=f"● KAYIT AKTİF: {config.OUTPUT_DIR}/{os.path.basename(msg['name'])}",
+                    fg="#10B981",
+                )
+                # MON-08 (madde 108): durum çubuğundaki tam yol/tooltip.
+                self.log_file_path = os.path.abspath(msg["name"])
+                self.path_label.config(text=f"Dosya: {truncate_path_for_display(self.log_file_path)}")
 
             elif msg_type == "new_boot":
                 # R2: yeni boot -> ts_ms sıfırdan başlar; eski boot'un yüksek
                 # ts'leriyle aynı grafikte karışmasın diye pencere temizlenir.
                 self.speed_history.clear()
+                # MON-06: eski boot'un yüksek zaman_ms'leri yeni boot'un
+                # düşük değerleriyle karışırsa sahte bir dev "boşluk" görünür
+                # -- bu bir gerçek iletişim kesintisi değil, temizlenmeli.
+                self.all_timestamps_ms.clear()
+
+            elif msg_type == "reject":
+                # MON-03 (madde 50/69): bozuk/aralık-dışı satır sayaçları.
+                if msg["reason"] == "parse_hatasi":
+                    self.parse_error_count += 1
+                elif msg["reason"] == "aralik_hatasi":
+                    self.range_error_count += 1
+
+            elif msg_type == "dedup":
+                # MON-13 (madde 109/3): aynı (seq, zaman_ms) ikilisi tekrar
+                # geldi -- dosyaya ikinci kez yazılmadı, yalnız sayaç artar.
+                self.dedup_count = msg["count"]
+
+            elif msg_type == "previous_session":
+                # MON-16 (madde 66): önceki oturumun son zaman_ms'i, MON-06'nın
+                # "maks ardışık zaman farkı" göstergesine dahil edilsin diye
+                # sıralı listeye eklenir -- bu oturumun ilk gerçek noktası
+                # geldiğinde aradaki fark doğal olarak hesaba katılır.
+                bisect.insort(self.all_timestamps_ms, msg["last_ts_ms"])
+
+            elif msg_type == "station_gap":
+                # MON-16: yer istasyonu (bu uygulama) yeniden başlamıştı,
+                # AKS tarafında TAMPONLANMAMIŞ bir boşluk tespit edildi --
+                # ekranda KALICI olarak görünür kalır (teknik kontrolde
+                # sorulursa gösterilebilsin).
+                self.station_gap_label.config(
+                    text=(
+                        f"⚠ YER İSTASYONU KESİNTİSİ: {msg['gap_sec']:.1f} sn veri kaybı "
+                        "(AKS tarafında tamponlanmadı)"
+                    )
+                )
+
+            elif msg_type == "cloud_sync_warning":
+                # MON-14 (madde 85): kayıt klasörü bir bulut senkron
+                # klasöründe -- UYARIR ama uygulamayı ENGELLEMEZ.
+                self.cloud_sync_label.config(
+                    text=(
+                        f"⚠ UYARI: Kayıt klasörü {msg['service']} senkron klasöründe — "
+                        "yarış öncesi senkronizasyonu duraklatın veya OUTPUT_DIR'i değiştirin."
+                    )
+                )
+
+            elif msg_type == "backup_status":
+                # MON-02 (madde 20): ikincil kaydın durumu -- birincili
+                # ETKİLEMEZ, yalnız gösterge güncellenir.
+                if msg.get("active"):
+                    self.backup_label.config(
+                        text=f"● YEDEK AKTİF: {os.path.basename(msg.get('path', ''))}",
+                        fg="#10B981",
+                    )
+                else:
+                    detail = msg.get("detail")
+                    text = "○ YEDEK KAYIT HATASI" if detail else "○ Yedek kayıt kapalı"
+                    if detail:
+                        text += f": {detail}"
+                    self.backup_label.config(text=text, fg="#F59E0B" if detail else "#475569")
+
+            elif msg_type == "worker_crashed":
+                # MON-01: worker kendi traceback'ini events log'a zaten yazdı;
+                # burada ekstra bir şey yapmaya gerek yok -- _refresh_worker_health
+                # thread'in artık is_alive() olmadığını görüp KAYIT DURDU'ya
+                # geçecek/yeniden başlatmayı deneyecek.
+                pass
 
         if self.last_packet_time is not None and (now - self.last_packet_time) > LINK_TIMEOUT_SEC:
             self.link_connected = False
 
         self._refresh_status_badge()
         self._refresh_interval_indicator(now)
+        self._refresh_worker_health()
+        self._refresh_stale_state(now)
+        self._refresh_max_gap_indicator()
+        self.counters_label.config(
+            text=f"Kabul: {self.packet_count} | Format hatası: {self.parse_error_count} "
+            f"| Aralık hatası: {self.range_error_count} | Tekrar (dedup): {self.dedup_count}"
+        )
+        self.row_count_label.config(text=f"{self.packet_count} satır")
 
         self.speed_history = trim_history_window(self.speed_history, config.GRAPH_WINDOW_SEC)
         self._redraw_graph()
 
         self.root.after(GUI_POLL_MS, self.update_gui)
+
+    def _refresh_stale_state(self, now):
+        """MON-05 (madde 49): son geçerli satırdan bu yana config.STALE_DATA_SEC
+        geçtiyse (veya hiç veri gelmediyse) TÜM kartlar "--" gösterip
+        soluklaşır; veri geri geldiğinde normale döner. Yalnız GÖSTERİMİ
+        etkiler, kayıt davranışına dokunmaz."""
+        is_stale, message = compute_stale_display(self.last_packet_time, now, config.STALE_DATA_SEC)
+
+        if is_stale:
+            for card in self._metric_cards:
+                card.set_stale(True, message)
+            self._data_is_stale = True
+        elif self._data_is_stale:
+            # Yalnız geçiş anında (bayat -> taze) çalışır -- bu turda ilgili
+            # kartlar zaten yukarıdaki mesaj işleme sırasında set_value/
+            # set_display ile taze içerik almış olur (bkz. MetricCard.set_stale
+            # yorumu); burada yalnız renk/bar sıfırlanır.
+            for card in self._metric_cards:
+                card.set_stale(False)
+            self._data_is_stale = False
+
+    def _refresh_max_gap_indicator(self):
+        gap_sec = max_consecutive_gap_sec(self.all_timestamps_ms)
+        self.max_gap_label.config(text=f"Maks. ardışık zaman farkı: {gap_sec:.1f} sn")
+        if gap_sec >= 5.0:
+            self.max_gap_label.config(bg="#EF4444", fg="white")
+        else:
+            self.max_gap_label.config(bg=self._default_interval_bg, fg="#94A3B8")
+
+    def _refresh_worker_health(self):
+        worker_alive = self.worker_thread.is_alive()
+        state = compute_worker_health_state(
+            worker_alive, self.heartbeat.seconds_since_beat(), self.worker_restart_count
+        )
+
+        if state["should_restart"]:
+            self.worker_restart_count += 1
+            print(
+                f"Worker öldü, yeniden başlatılıyor (deneme "
+                f"{self.worker_restart_count}/{MAX_WORKER_RESTARTS})"
+            )
+            self._start_worker_thread(restart_attempt=self.worker_restart_count)
+            # Yeniden başlatma hemen ardından tekrar canlı sayılır --
+            # bu turda "KAYIT DURDU" göstermeye gerek yok.
+            state = compute_worker_health_state(
+                self.worker_thread.is_alive(), self.heartbeat.seconds_since_beat(),
+                self.worker_restart_count
+            )
+
+        if state["permanently_failed"]:
+            self.worker_permanently_failed = True
+
+        self.recording_stopped = state["recording_stopped"]
+        self._set_title()
+
+        if self.recording_stopped:
+            if not self._kayit_durdu_visible:
+                self.kayit_durdu_label.pack(anchor="w", pady=(4, 0))
+                self._kayit_durdu_visible = True
+            self._blink_tick += 1
+            if self._blink_tick % 3 == 0:  # ~600ms'de bir yanıp söner (200ms tick)
+                self._blink_on = not self._blink_on
+                if self._blink_on:
+                    self.kayit_durdu_label.config(bg="#7F1D1D", fg="#FCA5A5")
+                else:
+                    self.kayit_durdu_label.config(bg="#EF4444", fg="white")
+        elif self._kayit_durdu_visible:
+            self.kayit_durdu_label.pack_forget()
+            self._kayit_durdu_visible = False
 
     def _refresh_interval_indicator(self, now):
         if self.last_packet_time is None:
@@ -760,6 +910,12 @@ def parse_args(argv=None):
         help="Seri port (orn. COM5, /dev/cu.usbserial-xxx). Verilirse "
         "config.py'deki SERIAL_PORT degerini ezer.",
     )
+    parser.add_argument(
+        "--no-gui",
+        action="store_true",
+        help="MON-10 (madde 87): tkinter/matplotlib hic yuklenmeden, "
+        "konsoldan periyodik durum basan headless kayit modunda calistir.",
+    )
     return parser.parse_args(argv)
 
 
@@ -769,22 +925,6 @@ def resolve_serial_port(cli_port, config_port):
     aynen kullanilir. Saf fonksiyon -- argparse/tkinter/config'e dokunmadan
     test edilebilir."""
     return cli_port if cli_port is not None else config_port
-
-
-def list_available_ports():
-    """Sistemde gorunen seri portlarin device adlarini dondurur (pyserial
-    list_ports sarmalayicisi); gercek donanim gerektirdiginden ayri bir
-    fonksiyonda tutulur ki cagiran taraf (main) testte kolayca mock'layabilsin."""
-    return [p.device for p in list_ports.comports()]
-
-
-def format_port_list_message(ports):
-    """list_available_ports() ciktisini konsola basilacak insan-okunur bir
-    metne cevirir; saf fonksiyon oldugu icin gercek donanim/pyserial
-    olmadan test edilebilir."""
-    if not ports:
-        return "Sistemde seri port bulunamadi."
-    return "Bulunan seri portlar: " + ", ".join(ports)
 
 
 def main():
@@ -798,6 +938,48 @@ def main():
         print(format_port_list_message(list_available_ports()))
         print("Gercek kayit icin --port COMx verin (orn. python monitor.py --port COM5).")
 
+    # MON-12 (madde 84): OUTPUT_DIR gercekten YAZILABILIR mi diye acilista
+    # kontrol edilir -- degilse uygulama BASLATILMAZ (sessizce baska yere
+    # yazma YERINE net bir hatayla cikilir).
+    try:
+        check_output_dir_writable(config.OUTPUT_DIR)
+    except RuntimeError as exc:
+        print(f"BAŞLATILAMADI: {exc}")
+        sys.exit(1)
+    print(f"Kayıt klasörü: {os.path.abspath(config.OUTPUT_DIR)}")
+
+    # MON-14 (madde 85): kayıt klasörü bir bulut senkron klasöründeyse
+    # konsola da net bir uyarı basılır (GUI/events log uyarısı serial_worker
+    # içinde ayrıca yapılır) -- uygulama yine de BAŞLAR, yalnız uyarır.
+    cloud_marker = detect_cloud_sync_folder(config.OUTPUT_DIR)
+    if cloud_marker:
+        print(
+            f"UYARI: Kayıt klasörü bir bulut senkron klasöründe ({cloud_marker}). "
+            "Yarış öncesi senkronizasyonu duraklatın veya OUTPUT_DIR'i değiştirin."
+        )
+
+    if args.no_gui:
+        print("Headless (--no-gui) modu seçildi -- tkinter/matplotlib yüklenmeyecek.")
+        run_headless()
+        return
+
+    try:
+        run_gui()
+    except ImportError as exc:
+        # MON-10 (madde 87): tkinter veya matplotlib yüklenemezse uygulama
+        # ÇIKMAZ -- otomatik olarak headless moda düşer, bunu NET yazar.
+        print(
+            f"UYARI: GUI başlatılamadı ({exc}) -- otomatik olarak HEADLESS "
+            "moda düşülüyor. Grafik arayüz olmadan kayıt DEVAM EDECEK."
+        )
+        run_headless()
+
+
+def run_gui():
+    """MON-10: tkinter/matplotlib'i (lazy) yükler ve GUI mainloop'unu
+    başlatır. Bu fonksiyon çağrılmadan monitor.py import etmek tkinter/
+    matplotlib gerektirmez (bkz. _load_gui_dependencies)."""
+    _load_gui_dependencies()
     root = tk.Tk()
     MonitorApp(root)
     root.mainloop()

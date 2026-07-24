@@ -1,7 +1,7 @@
 """Seri port dayaniklilik testleri: fake-serial ile kopma/yeniden baglanma
 ve replay (eski ts, artan seq) senaryolari.
 
-Gercek pyserial/donanim kullanilmaz; monitor.serial_worker'a `connect`
+Gercek pyserial/donanim kullanilmaz; monitor_core.serial_worker'a `connect`
 parametresiyle sahte bir baglanti fabrikasi enjekte edilir.
 """
 
@@ -13,7 +13,7 @@ import time
 import serial
 
 import config
-import monitor
+import monitor_core
 from csv_logger import HEADER
 
 
@@ -95,7 +95,7 @@ def test_serial_disconnect_reconnect_same_file_no_row_loss(tmp_path, monkeypatch
     stop_event = threading.Event()
 
     worker = threading.Thread(
-        target=monitor.serial_worker,
+        target=monitor_core.serial_worker,
         args=(data_queue, stop_event),
         kwargs={"connect": connect, "reconnect_interval": 0.05},
         daemon=True,
@@ -146,7 +146,7 @@ def test_serial_never_available_does_not_crash_and_keeps_retrying(tmp_path, monk
     stop_event = threading.Event()
 
     worker = threading.Thread(
-        target=monitor.serial_worker,
+        target=monitor_core.serial_worker,
         args=(data_queue, stop_event),
         kwargs={"connect": connect, "reconnect_interval": 0.02},
         daemon=True,
@@ -184,7 +184,7 @@ def test_replay_ts_regression_logs_tag_without_touching_csv_schema(tmp_path, mon
     stop_event = threading.Event()
 
     worker = threading.Thread(
-        target=monitor.serial_worker,
+        target=monitor_core.serial_worker,
         args=(data_queue, stop_event),
         kwargs={"connect": connect, "reconnect_interval": 0.02},
         daemon=True,
@@ -227,7 +227,7 @@ def test_link_down_up_lines_not_written_to_csv(tmp_path, monkeypatch):
     stop_event = threading.Event()
 
     worker = threading.Thread(
-        target=monitor.serial_worker,
+        target=monitor_core.serial_worker,
         args=(data_queue, stop_event),
         kwargs={"connect": connect, "reconnect_interval": 0.02},
         daemon=True,
@@ -267,7 +267,7 @@ def test_simulate_mode_log_filenames_carry_sim_suffix(tmp_path, monkeypatch):
     stop_event = threading.Event()
 
     worker = threading.Thread(
-        target=monitor.serial_worker,
+        target=monitor_core.serial_worker,
         args=(data_queue, stop_event),
         kwargs={"connect": connect, "reconnect_interval": 0.02},
         daemon=True,
@@ -300,7 +300,7 @@ def test_real_port_mode_log_filenames_have_no_sim_suffix(tmp_path, monkeypatch):
     stop_event = threading.Event()
 
     worker = threading.Thread(
-        target=monitor.serial_worker,
+        target=monitor_core.serial_worker,
         args=(data_queue, stop_event),
         kwargs={"connect": connect, "reconnect_interval": 0.02},
         daemon=True,
@@ -336,7 +336,7 @@ def test_csv_messages_carry_ts_sec_from_packet_timestamp(tmp_path, monkeypatch):
     stop_event = threading.Event()
 
     worker = threading.Thread(
-        target=monitor.serial_worker,
+        target=monitor_core.serial_worker,
         args=(data_queue, stop_event),
         kwargs={"connect": connect, "reconnect_interval": 0.02},
         daemon=True,
@@ -374,7 +374,7 @@ def test_new_boot_message_emitted_on_real_boot_not_on_replay(tmp_path, monkeypat
     stop_event = threading.Event()
 
     worker = threading.Thread(
-        target=monitor.serial_worker,
+        target=monitor_core.serial_worker,
         args=(data_queue, stop_event),
         kwargs={"connect": connect, "reconnect_interval": 0.02},
         daemon=True,
@@ -409,7 +409,7 @@ def test_simulate_mode_new_boot_second_file_also_carries_sim_suffix(tmp_path, mo
     stop_event = threading.Event()
 
     worker = threading.Thread(
-        target=monitor.serial_worker,
+        target=monitor_core.serial_worker,
         args=(data_queue, stop_event),
         kwargs={"connect": connect, "reconnect_interval": 0.02},
         daemon=True,
@@ -447,3 +447,152 @@ def test_simulate_mode_new_boot_second_file_also_carries_sim_suffix(tmp_path, mo
         "kaydini icermeli; ikinci acilis tarafindan sessizce sifirlanmamis "
         "(truncate edilmemis) olmali"
     )
+
+
+# --- MON-03 (madde 50/69): bozuk/aralık-dışı satırlar sessizce atılmamalı ----
+
+
+def test_invalid_line_is_rejected_counted_and_logged_but_not_written_to_csv(tmp_path, monkeypatch):
+    """Sayısal olmayan/eksik alanlı bir CSV satırı sessizce atılmamalı --
+    sayılmalı (queue'ya 'reject' mesajı) ve HAM haliyle events log'a
+    düşülmeli; jüri dosyasına YAZILMAMALI."""
+    monkeypatch.chdir(tmp_path)
+
+    batch = [
+        b"CSV,1000,300,32,780\r\n",  # eksik alan -> parse_hatasi
+        csv_line(1100, 300, 32, 780, 6283, 1),  # gecerli
+    ]
+    connect = scripted_connect_factory([batch])
+
+    data_queue = queue.Queue()
+    stop_event = threading.Event()
+
+    worker = threading.Thread(
+        target=monitor_core.serial_worker,
+        args=(data_queue, stop_event),
+        kwargs={"connect": connect, "reconnect_interval": 0.02},
+        daemon=True,
+    )
+    worker.start()
+    messages = drain_until(data_queue, "csv", 1)
+    stop_event.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    reject_messages = [m for m in messages if m["type"] == "reject"]
+    assert len(reject_messages) == 1
+    assert reject_messages[0]["reason"] == "parse_hatasi"
+
+    log_files = list((tmp_path / "logs").glob("telem_*.csv"))
+    lines = log_files[0].read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1 + 1, "bozuk satir dosyaya YAZILMAMALI, yalniz gecerli 1 satir olmali"
+
+    events_files = list((tmp_path / "logs").glob("events_*.log"))
+    events_text = events_files[0].read_text(encoding="utf-8")
+    assert "REDDEDILEN SATIR (parse_hatasi)" in events_text
+    assert "CSV,1000,300,32,780" in events_text, "ham satir events log'a dusmeli"
+
+
+def test_out_of_range_line_is_rejected_with_aralik_hatasi_reason(tmp_path, monkeypatch):
+    """Sayısal ama aralık dışı bir alan (örneğin aşırı hız) TÜM satırı
+    reddetmeli -- 'aralik_hatasi' olarak sayılmalı/loglanmalı."""
+    monkeypatch.chdir(tmp_path)
+
+    too_fast_x10 = int((config.MAX_SPEED_KMH + 50) * 10)
+    batch = [
+        csv_line(1000, too_fast_x10, 32, 780, 6283, 1),  # hiz aralik disi
+        csv_line(1100, 300, 32, 780, 6283, 2),  # gecerli
+    ]
+    connect = scripted_connect_factory([batch])
+
+    data_queue = queue.Queue()
+    stop_event = threading.Event()
+
+    worker = threading.Thread(
+        target=monitor_core.serial_worker,
+        args=(data_queue, stop_event),
+        kwargs={"connect": connect, "reconnect_interval": 0.02},
+        daemon=True,
+    )
+    worker.start()
+    messages = drain_until(data_queue, "csv", 1)
+    stop_event.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    reject_messages = [m for m in messages if m["type"] == "reject"]
+    assert len(reject_messages) == 1
+    assert reject_messages[0]["reason"] == "aralik_hatasi"
+
+    log_files = list((tmp_path / "logs").glob("telem_*.csv"))
+    lines = log_files[0].read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1 + 1
+
+    events_files = list((tmp_path / "logs").glob("events_*.log"))
+    events_text = events_files[0].read_text(encoding="utf-8")
+    assert "REDDEDILEN SATIR (aralik_hatasi)" in events_text
+
+
+def test_rejected_line_raw_logging_is_rate_limited_per_second(tmp_path, monkeypatch):
+    """Flood'u önlemek için aynı sebep için saniyede en fazla
+    REJECT_LOG_MAX_PER_SEC ham satır loglanır; aşırı sayıda hata GUI
+    sayacında hâlâ görülür ama events log'unu taşırmaz."""
+    monkeypatch.chdir(tmp_path)
+
+    n_bad = monitor_core.REJECT_LOG_MAX_PER_SEC + 3
+    batch = [b"CSV,bad,line,here\r\n" for _ in range(n_bad)]
+    batch.append(csv_line(1000, 300, 32, 780, 6283, 1))
+    connect = scripted_connect_factory([batch])
+
+    data_queue = queue.Queue()
+    stop_event = threading.Event()
+
+    worker = threading.Thread(
+        target=monitor_core.serial_worker,
+        args=(data_queue, stop_event),
+        kwargs={"connect": connect, "reconnect_interval": 0.02},
+        daemon=True,
+    )
+    worker.start()
+    messages = drain_until(data_queue, "csv", 1)
+    stop_event.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    reject_messages = [m for m in messages if m["type"] == "reject"]
+    assert len(reject_messages) == n_bad, "sayac RATE LIMITE BAKMAKSIZIN her reddi saymali"
+
+    events_files = list((tmp_path / "logs").glob("events_*.log"))
+    events_text = events_files[0].read_text(encoding="utf-8")
+    logged_raw_count = events_text.count("REDDEDILEN SATIR (parse_hatasi): CSV,bad,line,here")
+    assert logged_raw_count <= monitor_core.REJECT_LOG_MAX_PER_SEC, (
+        "diske yazilan HAM satir sayisi saniyede sinirlandirilmali"
+    )
+
+
+def test_csv_message_carries_raw_timestamp_ms_field(tmp_path, monkeypatch):
+    """MON-04/06 (madde 48, 67/68): ZAMAN kartı ve maks. ardışık zaman farkı
+    göstergesi ham (tam sayı) zaman_ms değerine ihtiyaç duyar -- 'csv'
+    mesajı bunu doğrudan taşımalı (ts_sec zaten bunun /1000'i olsa da)."""
+    monkeypatch.chdir(tmp_path)
+
+    batch = [csv_line(754567, 300, 32, 780, 6283, 1)]
+    connect = scripted_connect_factory([batch])
+
+    data_queue = queue.Queue()
+    stop_event = threading.Event()
+
+    worker = threading.Thread(
+        target=monitor_core.serial_worker,
+        args=(data_queue, stop_event),
+        kwargs={"connect": connect, "reconnect_interval": 0.02},
+        daemon=True,
+    )
+    worker.start()
+    messages = drain_until(data_queue, "csv", 1)
+    stop_event.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    csv_messages = [m for m in messages if m["type"] == "csv"]
+    assert csv_messages[0]["timestamp_ms"] == 754567
