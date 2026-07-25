@@ -39,6 +39,43 @@ uygulama başlangıçta sistemde görünen seri portları (pyserial
 `list_ports`) konsola listeler ve gerçek kayıt için `--port COMx`
 verilmesi gerektiğini hatırlatır.
 
+## Aynı anda iki izleme (UKS terminali + Monitor) — Y26
+
+**Bir seri portu aynı anda yalnızca TEK program açabilir.** Bu bir kod
+eksiği değil, işletim sistemi kısıtıdır: port bir programa verildiğinde
+diğeri onu açamaz ("access denied" / "port meşgul"). Bu yüzden UKS
+terminal-izleme ile TUFAN-Monitor GUI'sini aynı porta aynı anda
+bağlayamazsınız.
+
+### Seçenek 1 (ÖNERİLEN): yalnız TUFAN-Monitor kullanın
+
+Monitor, UKS terminalinin gösterdiği her şeyi zaten gösteriyor — üstelik
+grafik ve kayıtla birlikte. Ayrıca ham satırları görmek için ayrı bir
+terminale de ihtiyacınız yok:
+
+> **Ham Veri paneli:** Alt bardaki **"Ham Veri (F2)"** düğmesi (veya **F2**
+> tuşu) hattan gelen ham satırları (`CSV,...`, `LINK,...` vb.) kaydıran bir
+> panelde gösterir. Son ~50 satır tutulur, panel **salt-okunurdur** ve
+> **kayıt davranışını etkilemez**. Performans için varsayılan olarak
+> **kapalıdır**; kapalıyken satırlar yalnızca tampona yazılır, ekran
+> güncellenmez.
+
+Yarış sırasında Monitor tek başına yeterlidir.
+
+### Seçenek 2: iki ayrı USB-seri dönüştürücü + iki UKS kartı
+
+Biri terminale, diğeri Monitor'e bağlanır. Her instance farklı bir portla
+çalıştırılır:
+
+```
+python monitor.py --port COM5
+python monitor.py --port COM7
+```
+
+Pratik değil (iki kart + iki dönüştürücü gerekir) ama mümkündür. Kayıt
+dosyası adları saniye çözünürlüklü olduğundan aynı anda başlatılan iki
+instance çakışmaz — ikinci dosya `_2` ekiyle açılır.
+
 ## Headless (GUI'siz) mod — madde 87
 
 tkinter veya matplotlib bir laptopta açılamazsa (sürücü sorunu, eksik Tk

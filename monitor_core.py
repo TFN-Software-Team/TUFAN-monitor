@@ -693,6 +693,18 @@ def serial_worker(data_queue, stop_event, connect=open_serial_connection,
             if not line:
                 continue
 
+            # Y26 — HAM SATIR YAYINI (GUI'deki opsiyonel terminal paneli için).
+            # Bir seri portu aynı anda TEK program açabilir (işletim sistemi
+            # kısıtı), bu yüzden UKS terminal-izleme ile Monitor GUI'si BİRLİKTE
+            # çalıştırılamıyordu. Çözüm: ham satırları Monitor'ün kendi içinde
+            # göstermek — ayrı bir terminal programına ihtiyaç kalmaz.
+            #
+            # KAYIT DAVRANIŞINI ETKİLEMEZ: bu yalnızca GUI kuyruğuna bir kopya
+            # bırakır; aşağıdaki ayrıştırma/yazma yolu DEĞİŞMEDİ. Kuyruk
+            # tüketilmezse (GUI kapalı/headless) mesajlar update_gui tarafından
+            # zaten boşaltılır ve panel kapalıyken atılır.
+            data_queue.put({"type": "raw_line", "line": line})
+
             if line.startswith("CSV,"):
                 parsed, reject_reason = parse_csv_line_verbose(line)
                 if parsed is None:
