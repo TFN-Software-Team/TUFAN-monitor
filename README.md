@@ -39,6 +39,43 @@ uygulama başlangıçta sistemde görünen seri portları (pyserial
 `list_ports`) konsola listeler ve gerçek kayıt için `--port COMx`
 verilmesi gerektiğini hatırlatır.
 
+## Aynı anda iki izleme (UKS terminali + Monitor) — Y26
+
+**Bir seri portu aynı anda yalnızca TEK program açabilir.** Bu bir kod
+eksiği değil, işletim sistemi kısıtıdır: port bir programa verildiğinde
+diğeri onu açamaz ("access denied" / "port meşgul"). Bu yüzden UKS
+terminal-izleme ile TUFAN-Monitor GUI'sini aynı porta aynı anda
+bağlayamazsınız.
+
+### Seçenek 1 (ÖNERİLEN): yalnız TUFAN-Monitor kullanın
+
+Monitor, UKS terminalinin gösterdiği her şeyi zaten gösteriyor — üstelik
+grafik ve kayıtla birlikte. Ayrıca ham satırları görmek için ayrı bir
+terminale de ihtiyacınız yok:
+
+> **Ham Veri paneli:** Alt bardaki **"Ham Veri (F2)"** düğmesi (veya **F2**
+> tuşu) hattan gelen ham satırları (`CSV,...`, `LINK,...` vb.) kaydıran bir
+> panelde gösterir. Son ~50 satır tutulur, panel **salt-okunurdur** ve
+> **kayıt davranışını etkilemez**. Performans için varsayılan olarak
+> **kapalıdır**; kapalıyken satırlar yalnızca tampona yazılır, ekran
+> güncellenmez.
+
+Yarış sırasında Monitor tek başına yeterlidir.
+
+### Seçenek 2: iki ayrı USB-seri dönüştürücü + iki UKS kartı
+
+Biri terminale, diğeri Monitor'e bağlanır. Her instance farklı bir portla
+çalıştırılır:
+
+```
+python monitor.py --port COM5
+python monitor.py --port COM7
+```
+
+Pratik değil (iki kart + iki dönüştürücü gerekir) ama mümkündür. Kayıt
+dosyası adları saniye çözünürlüklü olduğundan aynı anda başlatılan iki
+instance çakışmaz — ikinci dosya `_2` ekiyle açılır.
+
 ## Headless (GUI'siz) mod — madde 87
 
 tkinter veya matplotlib bir laptopta açılamazsa (sürücü sorunu, eksik Tk
@@ -104,6 +141,39 @@ Her satır bir telemetri örneğidir.
 Araç sıfırlanıp (yeni boot) seri akışta seq sayacı geriye sıçradığında,
 uygulama otomatik olarak yeni bir log dosyasına geçer ve konsola bunu
 bildirir.
+
+Dosyalar `config.py` → `OUTPUT_DIR` (varsayılan `logs/`) altına yazılır.
+`BACKUP_OUTPUT_DIR` ayarlıysa her satır ikinci bir klasöre (örn. USB bellek)
+de yazılır; ikincil yazma hatası birincil kaydı **asla** etkilemez.
+
+> **Excel'de açarken:** CSV'yi **çift tıklayarak AÇMAYIN** — Türkçe
+> Windows'ta ayraç/ondalık ayarları yüzünden bozuk görünür. Doğru yöntem
+> `logs/OKUMA_TALIMATI.txt` içinde anlatılıyor (Veri → Metinden İçe Aktar,
+> ayırıcı `;`, ondalık `.`). **Ondalık ayracının nokta olması bilinçli bir
+> karardır.**
+
+## 9.2.h uyum raporu — `tools/rapor.py`
+
+Birincil kayıt dosyası **geliş sırasıyla** yazılır (kanıt bütünlüğü — bkz.
+`monitor_core.py` içindeki "R2 KARAR" notu). AKS bağlantı kesintisinden
+sonra tamponladığı paketleri replay ettiği için, bu dosyada `zaman_ms`
+kolonu geçici olarak geriye döner. Jüri ham dosyada ardışık fark hesaplarsa
+negatif/büyük değerler görebilir.
+
+`tools/rapor.py` bunu çözer: **birincil dosyaya DOKUNMAZ (yalnız okur)**,
+`zaman_ms`'e göre **sıralanmış bir türev dosya** üretir ve ardışık boşluk
+raporu basar (9.2.h: >5 sn boşluk olmamalı).
+
+```
+python tools/rapor.py logs/telem_20260724_120000.csv
+```
+
+Çıktı: `logs/telem_20260724_120000_sirali.csv` + konsolda uyum raporu.
+
+> **Teknik kontrolde jüriye ÜÇLÜYÜ birlikte sunun:** HAM dosya + SIRALI
+> türev dosya + rapor çıktısı. `rapor.py`'yi çalıştırmaya hazır bulundurun.
+
+Yarış sabahı kurulum adımları için: [PROVA_KONTROL_LISTESI.md](PROVA_KONTROL_LISTESI.md).
 
 ## Yönetmelik uyumu
 
@@ -209,15 +279,25 @@ bir uyarı basar (konsol, GUI başlığı altında kalıcı bir satır, ve
    OneDrive'ın dışında bir klasöre (örn. `C:\TUFAN_KAYIT\logs`) çevirin.
 4. Yarış bitince senkronizasyonu tekrar başlatmayı unutmayın.
 
-## Teknik kontrol provası (60 sn anten sök-tak senaryosu)
+## Bench provası — 60 sn kesinti senaryosu (TEKNİK KONTROL DEĞİL)
 
-Yönetmelik teknik kontrolünde jüriye gösterilecek prova adımları:
+> ⚠️ **MÜDAHALE YASAĞI — şartname 9.4.a.vii.**
+> Aşağıdaki adımlar **yalnızca kendi bench'inizde, teknik kontrolden ÖNCE**
+> yapılan bir provadır. **Teknik kontrol sırasında sisteme müdahale
+> YASAKTIR:** bağlantıyı **JÜRİ koparır, ekip değil.** Ekip o sırada hiçbir
+> kabloya/antene dokunmaz, hiçbir ayar değiştirmez — yalnızca ekranda
+> beklenen davranışı gösterir ve sorulara cevap verir.
+>
+> Bu bölümdeki "sökün / geri takın" ifadeleri **bench provası içindir.**
+> Teknik kontrolde karşılığı: "jüri koparır" / "jüri geri bağlar".
+
+Provada gözlenecek davranış (teknik kontrolde de aynısı beklenir):
 
 1. Uygulamayı çalışır ve telemetri akışı normal durumdayken başlatın.
    Durum rozeti **BAĞLI** (yeşil) olmalı, "Son kayıttan bu yana" göstergesi
    4 sn altında (varsayılan renk) kalmalı.
-2. **t=0 sn:** Aracın anten/seri bağlantısını (USB veya UKS-AKS radyo linki)
-   fiziksel olarak sökün.
+2. **t=0 sn:** Anten/seri bağlantı (USB veya UKS-AKS radyo linki) kesilir.
+   *(Bench'te siz sökersiniz; teknik kontrolde JÜRİ koparır.)*
    - Seri port kopmasıysa: rozet birkaç saniye içinde **SERİ PORT KOPUK**
      (gri) olur.
    - Yalnızca radyo linki kopmasıysa (`LINK,DOWN` alınırsa): rozet **KOPUK**
@@ -230,7 +310,8 @@ Yönetmelik teknik kontrolünde jüriye gösterilecek prova adımları:
    kapanmaz/çökmez. Konsolda ve `logs/events_*.log` dosyasında sırayla
    "SERI PORT KOPUK" / "LINK,DOWN alindi" ve 2 sn'de bir yeniden deneme
    kayıtları görülür.
-4. **t=60 sn:** Anten/kabloyu geri takın.
+4. **t=60 sn:** Anten/kablo geri bağlanır.
+   *(Bench'te siz takarsınız; teknik kontrolde JÜRİ geri bağlar.)*
    - Rozet **BAĞLI** durumuna döner (seri port önce **SERİ PORT KOPUK**'tan
      çıkar, ardından ilk `CSV,` paketiyle **KOPUK**'tan **BAĞLI**'ya geçer).
    - `logs/events_*.log` dosyasında "SERI PORT BAGLANDI" / "LINK,UP alindi"

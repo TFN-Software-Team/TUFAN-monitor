@@ -16,6 +16,7 @@ olmayan bir ortamda bile güvenle çalışır.
 
 import argparse
 import bisect
+import collections
 import os
 import queue
 import sys
@@ -45,6 +46,11 @@ from monitor_core import (
 
 LINK_TIMEOUT_SEC = 3.0
 GUI_POLL_MS = 200
+
+# Y26: ham satır panelinde tutulan azami satır sayısı (kaydıran tampon).
+# ~50 satır, 1 Hz telemetride son ~50 saniyeyi kapsar — "şu an ne geliyor?"
+# sorusuna cevap vermeye yeter, belleği ve widget güncellemesini sınırlar.
+RAW_PANEL_MAX_LINES = 50
 
 # MON-10: modül seviyesinde import EDİLMEZ (bkz. _load_gui_dependencies) --
 # yalnızca isim çözümlemesi için yer tutucu; MetricCard/_Tooltip/MonitorApp
@@ -288,6 +294,16 @@ class MonitorApp:
 
         # MON-08 (madde 108): durum çubuğu için tam dosya yolu ve satır sayısı.
         self.log_file_path = None
+
+        # Y26 (madde C): ham satır paneli. Bir seri portu aynı anda TEK program
+        # açabilir (işletim sistemi kısıtı), bu yüzden UKS terminal-izleme ile
+        # Monitor GUI'si BİRLİKTE çalıştırılamıyor. Panel, ham "CSV,/LINK," vb.
+        # satırları Monitor'ün İÇİNDE gösterir — ayrı terminal gerekmez.
+        # Varsayılan KAPALI (performans): her satır için widget güncellemesi
+        # yapmamak üzere panel kapalıyken satırlar yalnızca tampona yazılır.
+        self.raw_panel_visible = False
+        self.raw_lines = collections.deque(maxlen=RAW_PANEL_MAX_LINES)
+        self._raw_dirty = False
 
         self._build_widgets()
 
@@ -608,6 +624,76 @@ class MonitorApp:
         )
         self.row_count_label.pack(side="left", padx=(0, 6), pady=4)
 
+        # Y26: ham satır panelini aç/kapat. Klavye kısayolu da bağlanır (F2).
+        self.raw_panel_button = tk.Button(
+            bottom_bar,
+            text="Ham Veri (F2)",
+            font=("Helvetica Neue", 8),
+            command=self.toggle_raw_panel,
+            bg="#1E293B",
+            fg="#F8FAFC",
+            activebackground="#334155",
+            activeforeground="#F8FAFC",
+            relief="flat",
+            padx=8,
+            pady=2,
+        )
+        self.raw_panel_button.pack(side="right", padx=(0, 6), pady=4)
+
+        # --- Y26: ham satır paneli (salt-okunur, varsayılan GİZLİ) ---
+        # Bir COM portunu aynı anda tek program açabildiği için UKS terminal
+        # izlemeyle Monitor birlikte çalıştırılamıyordu; bu panel ham satırları
+        # Monitor'ün içinde göstererek o ihtiyacı ortadan kaldırır.
+        self.raw_panel_frame = tk.Frame(
+            self.root, bg="#0B0F19", highlightthickness=1, highlightbackground="#242F4D"
+        )
+        self.raw_text = tk.Text(
+            self.raw_panel_frame,
+            height=10,
+            font=("Consolas", 9),
+            bg="#0B0F19",
+            fg="#94A3B8",
+            insertbackground="#94A3B8",
+            relief="flat",
+            wrap="none",
+        )
+        raw_scroll = tk.Scrollbar(self.raw_panel_frame, command=self.raw_text.yview)
+        self.raw_text.configure(yscrollcommand=raw_scroll.set)
+        raw_scroll.pack(side="right", fill="y")
+        self.raw_text.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+        # SALT-OKUNUR: kullanıcı panele yazamaz/silemez (kanıt bütünlüğü
+        # açısından da doğru — panel bir görüntüdür, bir düzenleyici değil).
+        self.raw_text.config(state="disabled")
+
+        self.root.bind("<F2>", lambda _event: self.toggle_raw_panel())
+
+    def toggle_raw_panel(self):
+        """Y26: ham satır panelini aç/kapat.
+
+        Panel KAYIT DAVRANIŞINI ETKİLEMEZ — yalnızca zaten alınmış satırları
+        gösterir. Varsayılan kapalıdır: kapalıyken gelen satırlar yalnızca
+        kaydıran tampona yazılır, hiçbir widget güncellenmez (performans).
+        """
+        self.raw_panel_visible = not self.raw_panel_visible
+        if self.raw_panel_visible:
+            self.raw_panel_frame.pack(fill="both", padx=15, pady=(0, 10))
+            self._raw_dirty = True          # açılışta tamponu bir kez bas
+            self._refresh_raw_panel()
+        else:
+            self.raw_panel_frame.pack_forget()
+
+    def _refresh_raw_panel(self):
+        """Tamponu Text widget'ına basar. Yalnızca panel AÇIKKEN ve yeni satır
+        geldiyse çalışır (update_gui'den çağrılır)."""
+        if not self.raw_panel_visible or not self._raw_dirty:
+            return
+        self.raw_text.config(state="normal")
+        self.raw_text.delete("1.0", "end")
+        self.raw_text.insert("1.0", "\n".join(self.raw_lines))
+        self.raw_text.see("end")           # her zaman en son satır görünsün
+        self.raw_text.config(state="disabled")
+        self._raw_dirty = False
+
     def _open_log_folder(self):
         """MON-08 (madde 108): kayıt dosyasının bulunduğu klasörü Windows
         Gezgini'nde açar. Dosya henüz bilinmiyorsa (worker daha başlamadı)
@@ -676,6 +762,13 @@ class MonitorApp:
                 # doğru (geçmiş) konuma yerleşsin, listenin sonuna değil.
                 insert_sorted_point(self.speed_history, (msg["ts_sec"], msg["speed_kmh"]))
                 self.link_connected = True
+
+            elif msg_type == "raw_line":
+                # Y26: ham satır tamponu. Panel KAPALI olsa bile tampon dolar
+                # (açıldığı anda son ~50 satır hazır olsun); widget güncellemesi
+                # yalnızca panel AÇIKKEN yapılır — bkz. _refresh_raw_panel.
+                self.raw_lines.append(msg["line"])
+                self._raw_dirty = True
 
             elif msg_type == "link_down":
                 self.link_connected = False
@@ -793,6 +886,7 @@ class MonitorApp:
 
         self.speed_history = trim_history_window(self.speed_history, config.GRAPH_WINDOW_SEC)
         self._redraw_graph()
+        self._refresh_raw_panel()  # Y26 — panel kapalıysa hemen döner
 
         self.root.after(GUI_POLL_MS, self.update_gui)
 
