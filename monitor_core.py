@@ -776,6 +776,13 @@ def serial_worker(data_queue, stop_event, connect=open_serial_connection,
                     # karışmasın diye temizlenmeli -- dosya rotasyonu
                     # başarısız olsa bile (AKS gerçekten yeniden boot etti).
                     data_queue.put({"type": "new_boot"})
+                    # ORTA-2 FIX: Yeni boot'ta dedup penceresini temizle.
+                    # AKS yeniden başladığında seq 0'dan, ts_ms 0'dan başlar.
+                    # Önceki oturum kısa sürdüyse (<200 paket) pencerede hâlâ
+                    # küçük (seq, ts_ms) ikilileri kalır ve yeni boot'un ilk
+                    # satırları sessizce düşebilir (şartname 9.2.g ihlali).
+                    dedup_tracker = RecentKeyDedup(max_size=200)
+                    dedup_count = 0
                 elif is_replay_ts(prev_ts_ms, curr_ts_ms):
                     # 9.2.e: AKS offline-buffer drenajı sırasında replay edilen
                     # paketler eski ts taşır ama seq artmaya devam eder (bkz.
